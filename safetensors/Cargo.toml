@@ -23,6 +23,7 @@ exclude = [ "rust-toolchain", "target/*", "Cargo.lock"]
 
 [dependencies]
 hashbrown = { version = "0.15.4", features = ["serde"], optional = true }
+rustc-hash = "2.1.1"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 tikv-jemallocator = "0.6.0"

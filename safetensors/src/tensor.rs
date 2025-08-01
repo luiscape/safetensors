@@ -6,6 +6,8 @@ use core::str::Utf8Error;
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "std")]
 use std::io::Write;
+use rustc_hash::FxHashMap;
+
 
 const MAX_HEADER_SIZE: usize = 100_000_000;
 const N_LEN: usize = size_of::<u64>();
@@ -492,7 +494,7 @@ impl<'data> SafeTensors<'data> {
 pub struct Metadata {
     metadata: Option<HashMap<String, String>>,
     tensors: Vec<TensorInfo>,
-    index_map: HashMap<String, usize>,
+    index_map: FxHashMap<String, usize>,
 }
 
 /// Helper struct used only for serialization and deserialization
@@ -564,7 +566,10 @@ impl Metadata {
         metadata: Option<HashMap<String, String>>,
         tensors: Vec<(String, TensorInfo)>,
     ) -> Result<Self, SafeTensorError> {
-        let mut index_map = HashMap::with_capacity(tensors.len());
+        let mut index_map = FxHashMap::with_capacity_and_hasher(
+            tensors.len(),
+            rustc_hash::FxBuildHasher::default()
+        );
 
         let tensors: Vec<_> = tensors
             .into_iter()

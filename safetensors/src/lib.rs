@@ -3,6 +3,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 pub mod slice;
 pub mod tensor;
+use tikv_jemallocator::Jemalloc;
+
 /// serialize_to_file only valid in std
 #[cfg(feature = "std")]
 pub use tensor::serialize_to_file;
@@ -16,6 +18,9 @@ extern crate alloc;
 compile_error!("must choose either the `std` or `alloc` feature, but not both.");
 #[cfg(all(not(feature = "std"), not(feature = "alloc")))]
 compile_error!("must choose either the `std` or `alloc` feature");
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 /// A facade around all the types we need from the `std`, `core`, and `alloc`
 /// crates. This avoids elaborate import wrangling having to happen in every

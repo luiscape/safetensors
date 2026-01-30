@@ -32,17 +32,42 @@ hashbrown = { version = "0.16", features = ["serde"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+io-uring = { version = "0.6", optional = true }
+tempfile = { version = "3.10", optional = true }
+
 [dev-dependencies]
 criterion = "0.6"
 memmap2 = "0.9"
 proptest = "1.7"
+
+[dependencies.memmap2]
+version = "0.9"
+optional = true
 
 [features]
 default = ["std"]
 std = ["serde/default", "serde_json/default"]
 # Kept for backward compatibility - no-op since alloc is always available
 alloc = []
+# GPU loading support with CUDA streams and pinned memory
+gpu = ["std", "memmap2"]
+# GPU loading with actual CUDA runtime (requires CUDA toolkit)
+cuda = ["gpu"]
+# GPUDirect Storage support (requires NVIDIA GDS)
+gds = ["cuda"]
+# io_uring async I/O for Linux (kernel 5.1+)
+io-uring = ["gpu", "dep:io-uring", "dep:tempfile"]
 
 [[bench]]
 name = "benchmark"
 harness = false
+
+[[example]]
+name = "gpu_loading"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_loading_uring"
+required-features = ["gpu"]

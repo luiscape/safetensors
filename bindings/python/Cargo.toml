@@ -16,3 +16,9 @@ serde_json = "1.0"
 
 [dependencies.safetensors]
 path = "../../safetensors"
+features = []
+
+[features]
+default = []
+# GPU loading support with CUDA streams and pinned memory
+gpu = ["safetensors/gpu"]

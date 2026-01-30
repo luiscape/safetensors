@@ -1,6 +1,9 @@
 #![deny(missing_docs)]
 //! Dummy doc
 use core::slice;
+
+#[cfg(feature = "gpu")]
+mod gpu;
 use memmap2::{Mmap, MmapOptions};
 use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
@@ -1665,6 +1668,11 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<_safe_open_handle>()?;
     m.add("SafetensorError", m.py().get_type::<SafetensorError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+
+    // Register GPU submodule if compiled with GPU support
+    #[cfg(feature = "gpu")]
+    gpu::register_gpu_module(m)?;
+
     Ok(())
 }
 

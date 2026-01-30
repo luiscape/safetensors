@@ -3,6 +3,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 pub mod slice;
 pub mod tensor;
+
+/// GPU loading module with CUDA stream support and pinned memory pools.
+/// This module provides high-performance loading of safetensors directly to GPU memory.
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 /// serialize_to_file only valid in std
 #[cfg(feature = "std")]
 pub use tensor::serialize_to_file;

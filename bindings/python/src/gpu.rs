@@ -389,14 +389,25 @@ pub fn load_to_torch(
                 device.set_current()
                     .map_err(|e| GpuError::new_err(e.to_string()))?;
 
-                // Perform device-to-device copy
-                // cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice)
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        info.data_ptr as *const u8,
-                        tensor_data_ptr as *mut u8,
+                // Perform device-to-device copy using cudaMemcpy
+                // cudaMemcpyDeviceToDevice = 3
+                const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
+                extern "C" {
+                    fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
+                }
+                let result = unsafe {
+                    cudaMemcpy(
+                        tensor_data_ptr as *mut std::ffi::c_void,
+                        info.data_ptr as *const std::ffi::c_void,
                         info.size_bytes,
-                    );
+                        CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    )
+                };
+                if result != 0 {
+                    return Err(GpuError::new_err(format!(
+                        "cudaMemcpy device-to-device failed with error code {}",
+                        result
+                    )));
                 }
             }
 

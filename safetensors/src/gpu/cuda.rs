@@ -39,9 +39,6 @@ mod ffi {
         pub fn cudaFreeHost(ptr: *mut c_void) -> i32;
         pub fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
         pub fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: CudaStream) -> i32;
-    }
-    pub const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
-    extern "C" {
         pub fn cudaStreamCreateWithPriority(stream: *mut CudaStream, flags: u32, priority: i32) -> i32;
         pub fn cudaStreamDestroy(stream: CudaStream) -> i32;
         pub fn cudaStreamSynchronize(stream: CudaStream) -> i32;
@@ -69,7 +66,6 @@ mod ffi {
     pub const CUDA_HOST_ALLOC_WRITE_COMBINED: u32 = 4;
     pub const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
     pub const CUDA_STREAM_DEFAULT: u32 = 0;
-    pub const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 }
 
 #[allow(dead_code)]
@@ -355,22 +351,6 @@ pub fn memcpy_h2d_async(dst: *mut c_void, src: *const u8, size: usize, stream: &
     { check_cuda(unsafe { ffi::cudaMemcpyAsync(dst, src as *const c_void, size, ffi::CUDA_MEMCPY_HOST_TO_DEVICE, stream.raw()) }, "cudaMemcpyAsync (H2D)") }
     #[cfg(not(feature = "cuda"))]
     { unsafe { ptr::copy_nonoverlapping(src, dst as *mut u8, size); } let _ = stream; Ok(()) }
-}
-
-/// Copy data from device to device (synchronous).
-pub fn memcpy_d2d(dst: *mut c_void, src: *const c_void, size: usize) -> GpuResult<()> {
-    #[cfg(feature = "cuda")]
-    { check_cuda(unsafe { ffi::cudaMemcpy(dst, src, size, ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE) }, "cudaMemcpy (D2D)") }
-    #[cfg(not(feature = "cuda"))]
-    { unsafe { ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, size); } Ok(()) }
-}
-
-/// Copy data from device to device asynchronously.
-pub fn memcpy_d2d_async(dst: *mut c_void, src: *const c_void, size: usize, stream: &CudaStream) -> GpuResult<()> {
-    #[cfg(feature = "cuda")]
-    { check_cuda(unsafe { ffi::cudaMemcpyAsync(dst, src, size, ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE, stream.raw()) }, "cudaMemcpyAsync (D2D)") }
-    #[cfg(not(feature = "cuda"))]
-    { unsafe { ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, size); } let _ = stream; Ok(()) }
 }
 
 pub fn init() -> GpuResult<()> {

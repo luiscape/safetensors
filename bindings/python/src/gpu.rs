@@ -389,13 +389,49 @@ pub fn load_to_torch(
                 device.set_current()
                     .map_err(|e| GpuError::new_err(e.to_string()))?;
 
+                // Validate pointers before attempting copy
+                if info.data_ptr == 0 {
+                    return Err(GpuError::new_err(format!(
+                        "Source GPU pointer is null for tensor '{}' (size={})",
+                        name, info.size_bytes
+                    )));
+                }
+                if tensor_data_ptr == 0 {
+                    return Err(GpuError::new_err(format!(
+                        "Destination PyTorch tensor pointer is null for tensor '{}' (size={})",
+                        name, info.size_bytes
+                    )));
+                }
+                if info.size_bytes == 0 {
+                    // Skip zero-sized tensors
+                    result.set_item(&name, tensor)?;
+                    continue;
+                }
+
+                // Synchronize to ensure all previous CUDA operations are complete
+                extern "C" {
+                    fn cudaDeviceSynchronize() -> i32;
+                    fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
+                    fn cudaGetLastError() -> i32;
+                    fn cudaPeekAtLastError() -> i32;
+                }
+
+                // Synchronize before copy to ensure source data is ready
+                let sync_result = unsafe { cudaDeviceSynchronize() };
+                if sync_result != 0 {
+                    return Err(GpuError::new_err(format!(
+                        "cudaDeviceSynchronize failed with error code {} before memcpy",
+                        sync_result
+                    )));
+                }
+
+                // Clear any previous errors
+                unsafe { cudaGetLastError() };
+
                 // Perform device-to-device copy using cudaMemcpy
                 // cudaMemcpyDeviceToDevice = 3
                 const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
-                extern "C" {
-                    fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
-                }
-                let result = unsafe {
+                let memcpy_result = unsafe {
                     cudaMemcpy(
                         tensor_data_ptr as *mut std::ffi::c_void,
                         info.data_ptr as *const std::ffi::c_void,
@@ -403,10 +439,11 @@ pub fn load_to_torch(
                         CUDA_MEMCPY_DEVICE_TO_DEVICE,
                     )
                 };
-                if result != 0 {
+                if memcpy_result != 0 {
+                    let last_error = unsafe { cudaPeekAtLastError() };
                     return Err(GpuError::new_err(format!(
-                        "cudaMemcpy device-to-device failed with error code {}",
-                        result
+                        "cudaMemcpy device-to-device failed with error code {} (last error: {}), src_ptr=0x{:x}, dst_ptr=0x{:x}, size={}",
+                        memcpy_result, last_error, info.data_ptr, tensor_data_ptr, info.size_bytes
                     )));
                 }
             }

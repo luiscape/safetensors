@@ -383,21 +383,19 @@ pub fn load_to_torch(
             // This requires the CUDA runtime, which we have via our gpu module
             #[cfg(feature = "gpu")]
             {
-                use safetensors::gpu::low_level::CudaDevice;
+                use safetensors::gpu::low_level::{memcpy_d2d, CudaDevice};
                 let device = CudaDevice::new(device_id)
                     .map_err(|e| GpuError::new_err(e.to_string()))?;
                 device.set_current()
                     .map_err(|e| GpuError::new_err(e.to_string()))?;
 
-                // Perform device-to-device copy
-                // cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice)
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        info.data_ptr as *const u8,
-                        tensor_data_ptr as *mut u8,
-                        info.size_bytes,
-                    );
-                }
+                // Perform device-to-device copy using CUDA memcpy
+                memcpy_d2d(
+                    tensor_data_ptr as *mut std::ffi::c_void,
+                    info.data_ptr as *const std::ffi::c_void,
+                    info.size_bytes,
+                )
+                .map_err(|e| GpuError::new_err(e.to_string()))?;
             }
 
             result.set_item(name, tensor)?;

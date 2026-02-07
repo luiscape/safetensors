@@ -331,18 +331,60 @@ pub fn load_to_torch(
 
     #[cfg(feature = "gpu")]
     {
+        use safetensors::gpu::{GpuLoader, GpuLoaderConfig as RustConfig};
+
+        let rust_config = RustConfig {
+            num_streams: config.num_streams,
+            max_pinned_memory: config.max_pinned_memory,
+            device_id: config.device_id,
+            double_buffer: config.double_buffer,
+            ..Default::default()
+        };
+
+        let loader = GpuLoader::new(rust_config)
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+
+        // Open and parse the safetensors file
+        let file = std::fs::File::open(&filename)
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+        let safetensors = safetensors::SafeTensors::deserialize(&mmap)
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+
+        // Get list of tensor names to load
+        let names_to_load: Vec<String> = if let Some(names) = tensor_names {
+            names
+        } else {
+            safetensors.names().into_iter().map(|s| s.to_string()).collect()
+        };
+
         // Import torch
         let torch = PyModule::import(py, "torch")?;
-
-        // Load tensors to GPU
-        let gpu_tensors = load_to_gpu(py, filename, Some(config), tensor_names)?;
-
-        // Convert to PyTorch tensors
         let result = PyDict::new(py);
 
-        for (name, info) in gpu_tensors {
+        extern "C" {
+            fn cudaDeviceSynchronize() -> i32;
+            fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
+            fn cudaFree(ptr: *mut std::ffi::c_void) -> i32;
+        }
+
+        // Process tensors one at a time to minimize memory usage
+        for name in names_to_load {
+            // Load single tensor to GPU
+            let gpu_tensors = loader.load_tensors(&safetensors, &[name.as_str()])
+                .map_err(|e| GpuError::new_err(e.to_string()))?;
+
+            let (_, gpu_tensor) = gpu_tensors.into_iter().next()
+                .ok_or_else(|| GpuError::new_err(format!("Tensor '{}' not found", name)))?;
+
+            let dtype_str = format!("{:?}", gpu_tensor.dtype());
+            let shape = gpu_tensor.shape().to_vec();
+            let size_bytes = gpu_tensor.size_bytes();
+            let src_ptr = gpu_tensor.as_ptr();
+
             // Map dtype string to torch dtype
-            let torch_dtype = match info.dtype.as_str() {
+            let torch_dtype = match dtype_str.as_str() {
                 "F32" => torch.getattr("float32")?,
                 "F64" => torch.getattr("float64")?,
                 "F16" => torch.getattr("float16")?,
@@ -358,15 +400,9 @@ pub fn load_to_torch(
                 }
             };
 
-            // Create tensor from GPU pointer using torch.cuda.memory
-            // Note: This is a simplified approach. A full implementation would use
-            // torch.cuda.ExternalMem or similar for proper memory management.
-            let _cuda = torch.getattr("cuda")?;
-
-            // For now, we'll create an empty tensor and use unsafe copy
-            // In production, you'd want to use torch's external memory API
-            let shape: Vec<i64> = info.shape.iter().map(|&x| x as i64).collect();
-            let shape_list = PyList::new(py, &shape)?;
+            // Create empty PyTorch tensor on GPU
+            let shape_i64: Vec<i64> = shape.iter().map(|&x| x as i64).collect();
+            let shape_list = PyList::new(py, &shape_i64)?;
 
             let kwargs = PyDict::new(py);
             kwargs.set_item("dtype", torch_dtype)?;
@@ -374,81 +410,42 @@ pub fn load_to_torch(
 
             let tensor = torch.call_method("empty", (shape_list,), Some(&kwargs))?;
 
+            // Skip zero-sized tensors
+            if size_bytes == 0 {
+                result.set_item(&name, tensor)?;
+                continue;
+            }
+
             // Get the data pointer of the new tensor
             let tensor_data_ptr: u64 = tensor
                 .call_method0("data_ptr")?
                 .extract()?;
 
-            // Copy data from our GPU buffer to the tensor's buffer
-            // This requires the CUDA runtime, which we have via our gpu module
-            #[cfg(feature = "gpu")]
-            {
-                use safetensors::gpu::low_level::CudaDevice;
-                let device = CudaDevice::new(device_id)
-                    .map_err(|e| GpuError::new_err(e.to_string()))?;
-                device.set_current()
-                    .map_err(|e| GpuError::new_err(e.to_string()))?;
+            // Synchronize before copy to ensure source data is ready
+            unsafe { cudaDeviceSynchronize() };
 
-                // Validate pointers before attempting copy
-                if info.data_ptr == 0 {
-                    return Err(GpuError::new_err(format!(
-                        "Source GPU pointer is null for tensor '{}' (size={})",
-                        name, info.size_bytes
-                    )));
-                }
-                if tensor_data_ptr == 0 {
-                    return Err(GpuError::new_err(format!(
-                        "Destination PyTorch tensor pointer is null for tensor '{}' (size={})",
-                        name, info.size_bytes
-                    )));
-                }
-                if info.size_bytes == 0 {
-                    // Skip zero-sized tensors
-                    result.set_item(&name, tensor)?;
-                    continue;
-                }
+            // Copy from our GPU buffer to PyTorch tensor
+            const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
+            let memcpy_result = unsafe {
+                cudaMemcpy(
+                    tensor_data_ptr as *mut std::ffi::c_void,
+                    src_ptr as *const std::ffi::c_void,
+                    size_bytes,
+                    CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                )
+            };
 
-                // Synchronize to ensure all previous CUDA operations are complete
-                extern "C" {
-                    fn cudaDeviceSynchronize() -> i32;
-                    fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
-                    fn cudaGetLastError() -> i32;
-                    fn cudaPeekAtLastError() -> i32;
-                }
-
-                // Synchronize before copy to ensure source data is ready
-                let sync_result = unsafe { cudaDeviceSynchronize() };
-                if sync_result != 0 {
-                    return Err(GpuError::new_err(format!(
-                        "cudaDeviceSynchronize failed with error code {} before memcpy",
-                        sync_result
-                    )));
-                }
-
-                // Clear any previous errors
-                unsafe { cudaGetLastError() };
-
-                // Perform device-to-device copy using cudaMemcpy
-                // cudaMemcpyDeviceToDevice = 3
-                const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
-                let memcpy_result = unsafe {
-                    cudaMemcpy(
-                        tensor_data_ptr as *mut std::ffi::c_void,
-                        info.data_ptr as *const std::ffi::c_void,
-                        info.size_bytes,
-                        CUDA_MEMCPY_DEVICE_TO_DEVICE,
-                    )
-                };
-                if memcpy_result != 0 {
-                    let last_error = unsafe { cudaPeekAtLastError() };
-                    return Err(GpuError::new_err(format!(
-                        "cudaMemcpy device-to-device failed with error code {} (last error: {}), src_ptr=0x{:x}, dst_ptr=0x{:x}, size={}",
-                        memcpy_result, last_error, info.data_ptr, tensor_data_ptr, info.size_bytes
-                    )));
-                }
+            if memcpy_result != 0 {
+                return Err(GpuError::new_err(format!(
+                    "cudaMemcpy device-to-device failed with error code {}",
+                    memcpy_result
+                )));
             }
 
-            result.set_item(name, tensor)?;
+            // Free the source GPU memory immediately after copy
+            // gpu_tensor will be dropped here, freeing its memory
+
+            result.set_item(&name, tensor)?;
         }
 
         Ok(result.into())

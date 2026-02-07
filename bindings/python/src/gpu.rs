@@ -343,13 +343,21 @@ pub fn load_to_torch(
 
     #[cfg(feature = "gpu")]
     {
-        use safetensors::gpu::low_level::CudaDevice;
+        use safetensors::gpu::low_level::{CudaDevice, CudaStream};
 
         // Set the CUDA device
         let cuda_device = CudaDevice::new(device_id)
             .map_err(|e| GpuError::new_err(e.to_string()))?;
         cuda_device.set_current()
             .map_err(|e| GpuError::new_err(e.to_string()))?;
+
+        // Create CUDA streams for async transfers
+        let num_streams = config.num_streams.max(1);
+        let mut streams: Vec<CudaStream> = Vec::with_capacity(num_streams);
+        for _ in 0..num_streams {
+            streams.push(CudaStream::new().map_err(|e| GpuError::new_err(e.to_string()))?);
+        }
+        let mut stream_idx = 0usize;
 
         // Open and parse the safetensors file
         let file = std::fs::File::open(&filename)
@@ -386,9 +394,9 @@ pub fn load_to_torch(
         let torch = PyModule::import(py, "torch")?;
         let result = PyDict::new(py);
 
-        // CUDA FFI - direct cudaMemcpy from mmap, let CUDA handle staging internally
+        // CUDA FFI - async memcpy with multiple streams
         extern "C" {
-            fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
+            fn cudaMemcpyAsync(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32, stream: *mut std::ffi::c_void) -> i32;
         }
         const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
 
@@ -430,25 +438,34 @@ pub fn load_to_torch(
             if !data.is_empty() {
                 let dst_ptr: u64 = tensor.call_method0("data_ptr")?.extract()?;
 
-                // Direct cudaMemcpy from mmap to GPU - CUDA handles staging internally
-                // This avoids the CPU memcpy to pinned buffer bottleneck
+                // Async memcpy using round-robin stream assignment
+                // This allows overlapping transfers with tensor creation
+                let stream = &streams[stream_idx];
+                stream_idx = (stream_idx + 1) % num_streams;
+
                 let err = unsafe {
-                    cudaMemcpy(
+                    cudaMemcpyAsync(
                         dst_ptr as *mut std::ffi::c_void,
                         data.as_ptr() as *const std::ffi::c_void,
                         data.len(),
                         CUDA_MEMCPY_HOST_TO_DEVICE,
+                        stream.raw(),
                     )
                 };
                 if err != 0 {
                     return Err(GpuError::new_err(format!(
-                        "cudaMemcpy failed with error code {} for tensor '{}'",
+                        "cudaMemcpyAsync failed with error code {} for tensor '{}'",
                         err, name
                     )));
                 }
             }
 
             result.set_item(name, tensor)?;
+        }
+
+        // Wait for all async transfers to complete
+        for stream in &streams {
+            stream.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
         }
 
         Ok(result.into())

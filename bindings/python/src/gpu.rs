@@ -343,7 +343,17 @@ pub fn load_to_torch(
 
     #[cfg(feature = "gpu")]
     {
-        use pyo3::types::PyByteArray;
+        use safetensors::gpu::low_level::{CudaDevice, CudaStream};
+
+        // Set the CUDA device
+        let cuda_device = CudaDevice::new(device_id)
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+        cuda_device.set_current()
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+
+        // Create a single CUDA stream for all transfers
+        let stream = CudaStream::new()
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
 
         // Open and parse the safetensors file
         let file = std::fs::File::open(&filename)
@@ -364,8 +374,13 @@ pub fn load_to_torch(
         let torch = PyModule::import(py, "torch")?;
         let result = PyDict::new(py);
 
-        // Use the same approach as safe_open: torch.frombuffer + .to(device)
-        // This leverages PyTorch's highly optimized internal transfer mechanism
+        // CUDA FFI - use async memcpy with a single stream
+        extern "C" {
+            fn cudaMemcpyAsync(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32, stream: *mut std::ffi::c_void) -> i32;
+        }
+        const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+
+        // Create all tensors and queue all transfers
         for name in &names_to_load {
             let view = safetensors.tensor(name)
                 .map_err(|e| GpuError::new_err(e.to_string()))?;
@@ -391,36 +406,44 @@ pub fn load_to_torch(
                 }
             };
 
-            let tensor = if data.is_empty() {
-                // Handle empty tensors
-                let shape_i64: Vec<i64> = shape.iter().map(|&x| x as i64).collect();
-                let shape_list = PyList::new(py, &shape_i64)?;
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("dtype", torch_dtype)?;
-                kwargs.set_item("device", device)?;
-                torch.call_method("zeros", (shape_list,), Some(&kwargs))?
-            } else {
-                // Create a PyByteArray view of the mmap data (zero-copy)
-                let byte_array = PyByteArray::new(py, data);
+            // Create empty PyTorch tensor on GPU
+            let shape_i64: Vec<i64> = shape.iter().map(|&x| x as i64).collect();
+            let shape_list = PyList::new(py, &shape_i64)?;
 
-                // Use torch.frombuffer to create CPU tensor (zero-copy view)
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("buffer", byte_array)?;
-                kwargs.set_item("dtype", torch_dtype)?;
-                let cpu_tensor = torch.call_method("frombuffer", (), Some(&kwargs))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("dtype", torch_dtype)?;
+            kwargs.set_item("device", device)?;
 
-                // Reshape to correct shape
-                let shape_i64: Vec<i64> = shape.iter().map(|&x| x as i64).collect();
-                let cpu_tensor = cpu_tensor.call_method1("reshape", (shape_i64,))?;
+            let tensor = torch.call_method("empty", (shape_list,), Some(&kwargs))?;
 
-                // Use .to(device) - this is PyTorch's optimized GPU transfer
-                let to_kwargs = PyDict::new(py);
-                to_kwargs.set_item("non_blocking", true)?;
-                cpu_tensor.call_method("to", (device,), Some(&to_kwargs))?
-            };
+            if !data.is_empty() {
+                let dst_ptr: u64 = tensor.call_method0("data_ptr")?.extract()?;
+
+                // Queue async copy - all transfers go to the same stream
+                let err = unsafe {
+                    cudaMemcpyAsync(
+                        dst_ptr as *mut std::ffi::c_void,
+                        data.as_ptr() as *const std::ffi::c_void,
+                        data.len(),
+                        CUDA_MEMCPY_HOST_TO_DEVICE,
+                        stream.raw(),
+                    )
+                };
+
+                if err != 0 {
+                    return Err(GpuError::new_err(format!(
+                        "cudaMemcpyAsync failed with error code {} for tensor '{}'",
+                        err, name
+                    )));
+                }
+            }
 
             result.set_item(name, tensor)?;
         }
+
+        // Single sync at the end - wait for all transfers to complete
+        stream.synchronize()
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
 
         Ok(result.into())
     }

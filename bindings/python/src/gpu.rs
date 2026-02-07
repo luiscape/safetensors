@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 // Create a custom exception for GPU errors
 pyo3::create_exception!(_safetensors_rust, GpuError, PyException);
@@ -376,6 +377,12 @@ pub fn load_to_torch(
         }
         const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
 
+        // Timing instrumentation
+        let total_start = Instant::now();
+        let mut tensor_creation_time = std::time::Duration::ZERO;
+        let mut memcpy_to_pinned_time = std::time::Duration::ZERO;
+        let mut sync_wait_time = std::time::Duration::ZERO;
+
         // Create two streams and two pinned buffers for double-buffered pipelining
         let stream_a = CudaStream::new().map_err(|e| GpuError::new_err(e.to_string()))?;
         let stream_b = CudaStream::new().map_err(|e| GpuError::new_err(e.to_string()))?;
@@ -436,7 +443,9 @@ pub fn load_to_torch(
             kwargs.set_item("dtype", torch_dtype)?;
             kwargs.set_item("device", device)?;
 
+            let create_start = Instant::now();
             let tensor = torch.call_method("empty", (shape_list,), Some(&kwargs))?;
+            tensor_creation_time += create_start.elapsed();
 
             if !data.is_empty() {
                 let dst_ptr: u64 = tensor.call_method0("data_ptr")?.extract()?;
@@ -447,8 +456,10 @@ pub fn load_to_torch(
 
                 // Wait for previous transfer on this stream to complete before reusing buffer
                 if prev_transfer_size > 0 {
+                    let sync_start = Instant::now();
                     current_stream.synchronize()
                         .map_err(|e| GpuError::new_err(e.to_string()))?;
+                    sync_wait_time += sync_start.elapsed();
                 }
 
                 // Handle tensors larger than buffer with chunked transfer
@@ -459,10 +470,13 @@ pub fn load_to_torch(
                         let chunk_len = (data.len() - offset).min(buf_size);
 
                         // Wait for stream before reusing buffer
+                        let sync_start = Instant::now();
                         current_stream.synchronize()
                             .map_err(|e| GpuError::new_err(e.to_string()))?;
+                        sync_wait_time += sync_start.elapsed();
 
                         // Copy chunk to pinned buffer
+                        let memcpy_start = Instant::now();
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 data[offset..offset + chunk_len].as_ptr(),
@@ -470,6 +484,7 @@ pub fn load_to_torch(
                                 chunk_len,
                             );
                         }
+                        memcpy_to_pinned_time += memcpy_start.elapsed();
 
                         // Async transfer to GPU
                         let err = unsafe {
@@ -494,6 +509,7 @@ pub fn load_to_torch(
                     prev_transfer_size = 0; // Already synced within the loop
                 } else {
                     // Copy tensor data to pinned buffer (CPU work)
+                    let memcpy_start = Instant::now();
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             data.as_ptr(),
@@ -501,6 +517,7 @@ pub fn load_to_torch(
                             data.len(),
                         );
                     }
+                    memcpy_to_pinned_time += memcpy_start.elapsed();
 
                     // Queue async transfer to GPU (returns immediately)
                     let err = unsafe {
@@ -528,12 +545,23 @@ pub fn load_to_torch(
         }
 
         // Wait for any remaining transfers
+        let final_sync_start = Instant::now();
         stream_a.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
         stream_b.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
+        sync_wait_time += final_sync_start.elapsed();
 
         // Free pinned memory
         host_free(pinned_a, buf_size).map_err(|e| GpuError::new_err(e.to_string()))?;
         host_free(pinned_b, buf_size).map_err(|e| GpuError::new_err(e.to_string()))?;
+
+        let total_time = total_start.elapsed();
+        eprintln!("[GPU Loader Timing]");
+        eprintln!("  Total time:          {:?}", total_time);
+        eprintln!("  Tensor creation:     {:?} ({:.1}%)", tensor_creation_time, 100.0 * tensor_creation_time.as_secs_f64() / total_time.as_secs_f64());
+        eprintln!("  Memcpy to pinned:    {:?} ({:.1}%)", memcpy_to_pinned_time, 100.0 * memcpy_to_pinned_time.as_secs_f64() / total_time.as_secs_f64());
+        eprintln!("  Sync wait (GPU DMA): {:?} ({:.1}%)", sync_wait_time, 100.0 * sync_wait_time.as_secs_f64() / total_time.as_secs_f64());
+        let other_time = total_time.saturating_sub(tensor_creation_time).saturating_sub(memcpy_to_pinned_time).saturating_sub(sync_wait_time);
+        eprintln!("  Other overhead:      {:?} ({:.1}%)", other_time, 100.0 * other_time.as_secs_f64() / total_time.as_secs_f64());
 
         Ok(result.into())
     }

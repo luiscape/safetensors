@@ -339,11 +339,12 @@ pub fn load_to_torch(
         cuda_device.set_current()
             .map_err(|e| GpuError::new_err(e.to_string()))?;
 
-        // Create CUDA streams for async transfers
-        let stream1 = CudaStream::new()
-            .map_err(|e| GpuError::new_err(e.to_string()))?;
-        let stream2 = CudaStream::new()
-            .map_err(|e| GpuError::new_err(e.to_string()))?;
+        // Create multiple CUDA streams for parallel transfers
+        let num_streams = config.num_streams.max(2);
+        let mut streams: Vec<CudaStream> = Vec::with_capacity(num_streams);
+        for _ in 0..num_streams {
+            streams.push(CudaStream::new().map_err(|e| GpuError::new_err(e.to_string()))?);
+        }
 
         // Open and parse the safetensors file
         let file = std::fs::File::open(&filename)
@@ -367,24 +368,35 @@ pub fn load_to_torch(
         // CUDA FFI
         extern "C" {
             fn cudaMemcpyAsync(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32, stream: *mut std::ffi::c_void) -> i32;
+            fn cudaStreamSynchronize(stream: *mut std::ffi::c_void) -> i32;
         }
         const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
 
-        // Allocate pinned buffers for double-buffering
-        let chunk_size = 256 << 20; // 256MB chunks
-        let pinned_buf1 = host_alloc(chunk_size, HostAllocFlags::default())
-            .map_err(|e| GpuError::new_err(e.to_string()))?;
-        let pinned_buf2 = host_alloc(chunk_size, HostAllocFlags::default())
-            .map_err(|e| GpuError::new_err(e.to_string()))?;
+        // Allocate pinned buffers - one per stream for true parallelism
+        let chunk_size = 64 << 20; // 64MB chunks - smaller for better pipelining
+        let mut pinned_bufs: Vec<*mut u8> = Vec::with_capacity(num_streams);
+        for _ in 0..num_streams {
+            let buf = host_alloc(chunk_size, HostAllocFlags::default())
+                .map_err(|e| GpuError::new_err(e.to_string()))?;
+            pinned_bufs.push(buf);
+        }
 
-        let mut current_buf = pinned_buf1;
-        let mut other_buf = pinned_buf2;
-        let mut current_stream = &stream1;
-        let mut other_stream = &stream2;
+        // Track which stream/buffer to use next
+        let mut stream_idx = 0usize;
 
-        // Process each tensor
-        for name in names_to_load {
-            let view = safetensors.tensor(&name)
+        // Collect all tensors info first to enable batching
+        struct TensorTransfer<'a> {
+            name: String,
+            data: &'a [u8],
+            tensor: pyo3::Bound<'a, pyo3::PyAny>,
+            dst_ptr: u64,
+        }
+
+        let mut transfers: Vec<TensorTransfer> = Vec::with_capacity(names_to_load.len());
+
+        // Create all PyTorch tensors first (this is fast)
+        for name in &names_to_load {
+            let view = safetensors.tensor(name)
                 .map_err(|e| GpuError::new_err(e.to_string()))?;
 
             let dtype_str = format!("{:?}", view.dtype());
@@ -418,74 +430,96 @@ pub fn load_to_torch(
 
             let tensor = torch.call_method("empty", (shape_list,), Some(&kwargs))?;
 
-            // Skip zero-sized tensors
             if data.is_empty() {
-                result.set_item(&name, tensor)?;
+                result.set_item(name, &tensor)?;
                 continue;
             }
 
-            // Get the data pointer of the PyTorch tensor
-            let tensor_data_ptr: u64 = tensor
-                .call_method0("data_ptr")?
-                .extract()?;
+            let dst_ptr: u64 = tensor.call_method0("data_ptr")?.extract()?;
 
-            // Copy data directly from file (via mmap) to PyTorch tensor using pinned memory
+            transfers.push(TensorTransfer {
+                name: name.clone(),
+                data,
+                tensor,
+                dst_ptr,
+            });
+        }
+
+        // Now transfer all data using pipelined async copies
+        // Process all chunks across all tensors in a round-robin fashion
+        struct PendingChunk {
+            stream_idx: usize,
+        }
+        let mut pending_syncs: std::collections::VecDeque<PendingChunk> = std::collections::VecDeque::new();
+
+        for transfer in &transfers {
             let mut offset = 0usize;
-            while offset < data.len() {
-                let end = (offset + chunk_size).min(data.len());
+
+            while offset < transfer.data.len() {
+                let end = (offset + chunk_size).min(transfer.data.len());
                 let chunk_len = end - offset;
 
-                // Wait for previous transfer on this stream/buffer to complete
-                current_stream.synchronize()
-                    .map_err(|e| GpuError::new_err(e.to_string()))?;
+                // If we've used all streams, wait for the oldest one
+                if pending_syncs.len() >= num_streams {
+                    if let Some(pending) = pending_syncs.pop_front() {
+                        unsafe { cudaStreamSynchronize(streams[pending.stream_idx].raw()) };
+                    }
+                }
 
-                // Copy chunk to pinned buffer
+                let buf = pinned_bufs[stream_idx];
+                let stream = &streams[stream_idx];
+
+                // Copy chunk to pinned buffer (CPU operation)
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        data[offset..end].as_ptr(),
-                        current_buf as *mut u8,
+                        transfer.data[offset..end].as_ptr(),
+                        buf,
                         chunk_len,
                     );
                 }
 
                 // Async copy from pinned buffer to GPU
-                let dst_ptr = (tensor_data_ptr as usize + offset) as *mut std::ffi::c_void;
-                let result = unsafe {
+                let dst_ptr = (transfer.dst_ptr as usize + offset) as *mut std::ffi::c_void;
+                let err = unsafe {
                     cudaMemcpyAsync(
                         dst_ptr,
-                        current_buf as *const std::ffi::c_void,
+                        buf as *const std::ffi::c_void,
                         chunk_len,
                         CUDA_MEMCPY_HOST_TO_DEVICE,
-                        current_stream.raw(),
+                        stream.raw(),
                     )
                 };
-                if result != 0 {
-                    // Clean up pinned memory before returning error
-                    let _ = host_free(current_buf, chunk_size);
-                    let _ = host_free(other_buf, chunk_size);
+                if err != 0 {
+                    // Clean up
+                    for buf in &pinned_bufs {
+                        let _ = host_free(*buf, chunk_size);
+                    }
                     return Err(GpuError::new_err(format!(
                         "cudaMemcpyAsync failed with error code {}",
-                        result
+                        err
                     )));
                 }
 
-                // Swap buffers and streams for double-buffering
-                std::mem::swap(&mut current_buf, &mut other_buf);
-                std::mem::swap(&mut current_stream, &mut other_stream);
-
+                pending_syncs.push_back(PendingChunk { stream_idx });
+                stream_idx = (stream_idx + 1) % num_streams;
                 offset = end;
             }
+        }
 
-            // Wait for all transfers for this tensor to complete
-            stream1.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
-            stream2.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
+        // Wait for all remaining transfers
+        for stream in &streams {
+            stream.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
+        }
 
-            result.set_item(&name, tensor)?;
+        // Add all tensors to result
+        for transfer in transfers {
+            result.set_item(&transfer.name, transfer.tensor)?;
         }
 
         // Clean up pinned memory
-        host_free(current_buf, chunk_size).map_err(|e| GpuError::new_err(e.to_string()))?;
-        host_free(other_buf, chunk_size).map_err(|e| GpuError::new_err(e.to_string()))?;
+        for buf in pinned_bufs {
+            host_free(buf, chunk_size).map_err(|e| GpuError::new_err(e.to_string()))?;
+        }
 
         Ok(result.into())
     }

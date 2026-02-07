@@ -213,7 +213,7 @@ pub fn load_to_gpu(
     {
         use safetensors::gpu::{GpuLoader, GpuLoaderConfig as RustConfig};
 
-        let config = config.unwrap_or_else(|| GpuLoaderConfig::new(4, 512, 0, true));
+        let config = config.unwrap_or_else(|| GpuLoaderConfig::new(4, 2048, 0, true));
 
         let rust_config = RustConfig {
             num_streams: config.num_streams,
@@ -324,7 +324,7 @@ pub fn load_to_torch(
         })
         .unwrap_or_else(|| GpuLoaderConfig {
             num_streams: 4,
-            max_pinned_memory: 512 << 20,
+            max_pinned_memory: 2 << 30,  // 2GB to support large tensors
             device_id,
             double_buffer: true,
         });

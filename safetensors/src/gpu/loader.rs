@@ -61,8 +61,8 @@ impl Default for GpuLoaderConfig {
     fn default() -> Self {
         Self {
             num_streams: 4,
-            max_pinned_memory: 512 << 20,
-            pinned_size_classes: vec![1 << 20, 4 << 20, 16 << 20, 64 << 20, 256 << 20],
+            max_pinned_memory: 2 << 30,
+            pinned_size_classes: vec![1 << 20, 4 << 20, 16 << 20, 64 << 20, 256 << 20, 512 << 20, 1 << 30, 2 << 30],
             device_id: 0,
             double_buffer: true,
             prefetch_size: 64 << 20,

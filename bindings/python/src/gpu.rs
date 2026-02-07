@@ -356,6 +356,22 @@ pub fn load_to_torch(
             .map_err(|e| GpuError::new_err(e.to_string()))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| GpuError::new_err(e.to_string()))?;
+
+        // Hint to kernel that we'll read sequentially - improves read-ahead
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+            }
+            const MADV_SEQUENTIAL: i32 = 2;
+            const MADV_WILLNEED: i32 = 3;
+            unsafe {
+                // Sequential access hint
+                madvise(mmap.as_ptr() as *mut std::ffi::c_void, mmap.len(), MADV_SEQUENTIAL);
+                // Also hint that we'll need this data soon (triggers read-ahead)
+                madvise(mmap.as_ptr() as *mut std::ffi::c_void, mmap.len(), MADV_WILLNEED);
+            }
+        }
         let safetensors = safetensors::SafeTensors::deserialize(&mmap)
             .map_err(|e| GpuError::new_err(e.to_string()))?;
 

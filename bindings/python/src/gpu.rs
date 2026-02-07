@@ -8,7 +8,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
 
 // Create a custom exception for GPU errors
 pyo3::create_exception!(_safetensors_rust, GpuError, PyException);
@@ -344,7 +343,7 @@ pub fn load_to_torch(
 
     #[cfg(feature = "gpu")]
     {
-        use safetensors::gpu::low_level::{CudaDevice, CudaStream, host_alloc, host_free, HostAllocFlags};
+        use safetensors::gpu::low_level::CudaDevice;
 
         // Set the CUDA device
         let cuda_device = CudaDevice::new(device_id)
@@ -371,44 +370,11 @@ pub fn load_to_torch(
         let torch = PyModule::import(py, "torch")?;
         let result = PyDict::new(py);
 
-        // CUDA FFI
+        // CUDA FFI - direct cudaMemcpy from mmap, let CUDA handle staging internally
         extern "C" {
-            fn cudaMemcpyAsync(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32, stream: *mut std::ffi::c_void) -> i32;
+            fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
         }
         const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
-
-        // Timing instrumentation
-        let total_start = Instant::now();
-        let mut tensor_creation_time = std::time::Duration::ZERO;
-        let mut memcpy_to_pinned_time = std::time::Duration::ZERO;
-        let mut sync_wait_time = std::time::Duration::ZERO;
-
-        // Create two streams and two pinned buffers for double-buffered pipelining
-        let stream_a = CudaStream::new().map_err(|e| GpuError::new_err(e.to_string()))?;
-        let stream_b = CudaStream::new().map_err(|e| GpuError::new_err(e.to_string()))?;
-
-        // Find max tensor size for buffer allocation (cap at 256MB)
-        let max_tensor_size: usize = names_to_load.iter()
-            .filter_map(|name| safetensors.tensor(name).ok())
-            .map(|v| v.data().len())
-            .max()
-            .unwrap_or(0)
-            .min(256 << 20);
-
-        let buf_size = if max_tensor_size == 0 { 1 << 20 } else { max_tensor_size };
-
-        let pinned_a = host_alloc(buf_size, HostAllocFlags::default())
-            .map_err(|e| GpuError::new_err(e.to_string()))?;
-        let pinned_b = host_alloc(buf_size, HostAllocFlags::default())
-            .map_err(|e| GpuError::new_err(e.to_string()))?;
-
-        let mut current_pinned = pinned_a;
-        let mut other_pinned = pinned_b;
-        let mut current_stream = &stream_a;
-        let mut other_stream = &stream_b;
-
-        // Pipelined processing: while GPU transfers tensor N, CPU prepares tensor N+1
-        let mut prev_transfer_size: usize = 0;
 
         for name in &names_to_load {
             let view = safetensors.tensor(name)
@@ -443,125 +409,31 @@ pub fn load_to_torch(
             kwargs.set_item("dtype", torch_dtype)?;
             kwargs.set_item("device", device)?;
 
-            let create_start = Instant::now();
             let tensor = torch.call_method("empty", (shape_list,), Some(&kwargs))?;
-            tensor_creation_time += create_start.elapsed();
 
             if !data.is_empty() {
                 let dst_ptr: u64 = tensor.call_method0("data_ptr")?.extract()?;
 
-                // Swap buffers and streams for double-buffering
-                std::mem::swap(&mut current_pinned, &mut other_pinned);
-                std::mem::swap(&mut current_stream, &mut other_stream);
-
-                // Wait for previous transfer on this stream to complete before reusing buffer
-                if prev_transfer_size > 0 {
-                    let sync_start = Instant::now();
-                    current_stream.synchronize()
-                        .map_err(|e| GpuError::new_err(e.to_string()))?;
-                    sync_wait_time += sync_start.elapsed();
-                }
-
-                // Handle tensors larger than buffer with chunked transfer
-                if data.len() > buf_size {
-                    // For large tensors, do chunked transfer
-                    let mut offset = 0;
-                    while offset < data.len() {
-                        let chunk_len = (data.len() - offset).min(buf_size);
-
-                        // Wait for stream before reusing buffer
-                        let sync_start = Instant::now();
-                        current_stream.synchronize()
-                            .map_err(|e| GpuError::new_err(e.to_string()))?;
-                        sync_wait_time += sync_start.elapsed();
-
-                        // Copy chunk to pinned buffer
-                        let memcpy_start = Instant::now();
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                data[offset..offset + chunk_len].as_ptr(),
-                                current_pinned,
-                                chunk_len,
-                            );
-                        }
-                        memcpy_to_pinned_time += memcpy_start.elapsed();
-
-                        // Async transfer to GPU
-                        let err = unsafe {
-                            cudaMemcpyAsync(
-                                (dst_ptr as usize + offset) as *mut std::ffi::c_void,
-                                current_pinned as *const std::ffi::c_void,
-                                chunk_len,
-                                CUDA_MEMCPY_HOST_TO_DEVICE,
-                                current_stream.raw(),
-                            )
-                        };
-                        if err != 0 {
-                            host_free(pinned_a, buf_size).ok();
-                            host_free(pinned_b, buf_size).ok();
-                            return Err(GpuError::new_err(format!(
-                                "cudaMemcpyAsync failed with error code {}", err
-                            )));
-                        }
-
-                        offset += chunk_len;
-                    }
-                    prev_transfer_size = 0; // Already synced within the loop
-                } else {
-                    // Copy tensor data to pinned buffer (CPU work)
-                    let memcpy_start = Instant::now();
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.as_ptr(),
-                            current_pinned,
-                            data.len(),
-                        );
-                    }
-                    memcpy_to_pinned_time += memcpy_start.elapsed();
-
-                    // Queue async transfer to GPU (returns immediately)
-                    let err = unsafe {
-                        cudaMemcpyAsync(
-                            dst_ptr as *mut std::ffi::c_void,
-                            current_pinned as *const std::ffi::c_void,
-                            data.len(),
-                            CUDA_MEMCPY_HOST_TO_DEVICE,
-                            current_stream.raw(),
-                        )
-                    };
-                    if err != 0 {
-                        host_free(pinned_a, buf_size).ok();
-                        host_free(pinned_b, buf_size).ok();
-                        return Err(GpuError::new_err(format!(
-                            "cudaMemcpyAsync failed with error code {}", err
-                        )));
-                    }
-
-                    prev_transfer_size = data.len();
+                // Direct cudaMemcpy from mmap to GPU - CUDA handles staging internally
+                // This avoids the CPU memcpy to pinned buffer bottleneck
+                let err = unsafe {
+                    cudaMemcpy(
+                        dst_ptr as *mut std::ffi::c_void,
+                        data.as_ptr() as *const std::ffi::c_void,
+                        data.len(),
+                        CUDA_MEMCPY_HOST_TO_DEVICE,
+                    )
+                };
+                if err != 0 {
+                    return Err(GpuError::new_err(format!(
+                        "cudaMemcpy failed with error code {} for tensor '{}'",
+                        err, name
+                    )));
                 }
             }
 
             result.set_item(name, tensor)?;
         }
-
-        // Wait for any remaining transfers
-        let final_sync_start = Instant::now();
-        stream_a.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
-        stream_b.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
-        sync_wait_time += final_sync_start.elapsed();
-
-        // Free pinned memory
-        host_free(pinned_a, buf_size).map_err(|e| GpuError::new_err(e.to_string()))?;
-        host_free(pinned_b, buf_size).map_err(|e| GpuError::new_err(e.to_string()))?;
-
-        let total_time = total_start.elapsed();
-        eprintln!("[GPU Loader Timing]");
-        eprintln!("  Total time:          {:?}", total_time);
-        eprintln!("  Tensor creation:     {:?} ({:.1}%)", tensor_creation_time, 100.0 * tensor_creation_time.as_secs_f64() / total_time.as_secs_f64());
-        eprintln!("  Memcpy to pinned:    {:?} ({:.1}%)", memcpy_to_pinned_time, 100.0 * memcpy_to_pinned_time.as_secs_f64() / total_time.as_secs_f64());
-        eprintln!("  Sync wait (GPU DMA): {:?} ({:.1}%)", sync_wait_time, 100.0 * sync_wait_time.as_secs_f64() / total_time.as_secs_f64());
-        let other_time = total_time.saturating_sub(tensor_creation_time).saturating_sub(memcpy_to_pinned_time).saturating_sub(sync_wait_time);
-        eprintln!("  Other overhead:      {:?} ({:.1}%)", other_time, 100.0 * other_time.as_secs_f64() / total_time.as_secs_f64());
 
         Ok(result.into())
     }

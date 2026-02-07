@@ -55,17 +55,20 @@ pub struct GpuLoaderConfig {
     pub device_id: i32,
     pub double_buffer: bool,
     pub prefetch_size: usize,
+    /// Maximum chunk size for large tensor transfers (default: 256MB)
+    pub max_chunk_size: usize,
 }
 
 impl Default for GpuLoaderConfig {
     fn default() -> Self {
         Self {
             num_streams: 4,
-            max_pinned_memory: 2 << 30,
-            pinned_size_classes: vec![1 << 20, 4 << 20, 16 << 20, 64 << 20, 256 << 20, 512 << 20, 1 << 30, 2 << 30],
+            max_pinned_memory: 512 << 20,
+            pinned_size_classes: vec![1 << 20, 4 << 20, 16 << 20, 64 << 20, 256 << 20],
             device_id: 0,
             double_buffer: true,
             prefetch_size: 64 << 20,
+            max_chunk_size: 256 << 20, // 256MB chunks for large tensors
         }
     }
 }
@@ -87,6 +90,8 @@ impl GpuLoaderConfigBuilder {
     pub fn prefetch_size(mut self, bytes: usize) -> Self { self.config.prefetch_size = bytes; self }
     pub fn prefetch_size_mb(mut self, mb: usize) -> Self { self.config.prefetch_size = mb << 20; self }
     pub fn pinned_size_classes(mut self, classes: Vec<usize>) -> Self { self.config.pinned_size_classes = classes; self }
+    pub fn max_chunk_size(mut self, bytes: usize) -> Self { self.config.max_chunk_size = bytes; self }
+    pub fn max_chunk_size_mb(mut self, mb: usize) -> Self { self.config.max_chunk_size = mb << 20; self }
     pub fn build(self) -> GpuLoaderConfig { self.config }
 }
 
@@ -218,11 +223,18 @@ impl GpuLoader {
         for name in names {
             let view = safetensors.tensor(name)?;
             let gpu_tensor = GpuTensor::new(&self.device, view.dtype(), view.shape().to_vec())?;
-            let stream = self.stream_pool.next_stream();
-            let mut pinned = self.pinned_pool.acquire(view.data().len())?;
-            pinned.copy_from_slice(view.data())?;
-            memcpy_h2d_async(gpu_tensor.as_ptr(), pinned.as_ptr(), view.data().len(), stream)?;
-            self.pinned_pool.release(pinned);
+            let data = view.data();
+
+            // Use chunked transfer for large tensors
+            if data.len() > self.config.max_chunk_size {
+                self.transfer_chunked(&gpu_tensor, data)?;
+            } else {
+                let stream = self.stream_pool.next_stream();
+                let mut pinned = self.pinned_pool.acquire(data.len())?;
+                pinned.copy_from_slice(data)?;
+                memcpy_h2d_async(gpu_tensor.as_ptr(), pinned.as_ptr(), data.len(), stream)?;
+                self.pinned_pool.release(pinned);
+            }
             tensors.insert(name.to_string(), gpu_tensor);
         }
 
@@ -230,14 +242,79 @@ impl GpuLoader {
         Ok(tensors)
     }
 
+    /// Transfer large tensor data in chunks using double-buffered async copies.
+    fn transfer_chunked(&self, gpu_tensor: &GpuTensor, data: &[u8]) -> GpuResult<()> {
+        let chunk_size = self.config.max_chunk_size;
+        let total_size = data.len();
+
+        // Acquire two buffers for double-buffering
+        let mut buffer_a = self.pinned_pool.acquire(chunk_size)?;
+        let mut buffer_b = self.pinned_pool.acquire(chunk_size)?;
+
+        let stream_a = self.stream_pool.next_stream();
+        let stream_b = self.stream_pool.next_stream();
+
+        let mut current_buffer = &mut buffer_a;
+        let mut current_stream = stream_a;
+        let mut other_buffer = &mut buffer_b;
+        let mut other_stream = stream_b;
+
+        let mut offset = 0usize;
+        let gpu_ptr = gpu_tensor.as_ptr() as usize;
+
+        // Process first chunk
+        if offset < total_size {
+            let end = (offset + chunk_size).min(total_size);
+            let chunk_data = &data[offset..end];
+            current_buffer.copy_from_slice(chunk_data)?;
+            let dst_ptr = (gpu_ptr + offset) as *mut c_void;
+            memcpy_h2d_async(dst_ptr, current_buffer.as_ptr(), chunk_data.len(), current_stream)?;
+            offset = end;
+        }
+
+        // Process remaining chunks with double-buffering
+        while offset < total_size {
+            std::mem::swap(&mut current_buffer, &mut other_buffer);
+            std::mem::swap(&mut current_stream, &mut other_stream);
+
+            let end = (offset + chunk_size).min(total_size);
+            let chunk_data = &data[offset..end];
+
+            // Wait for current stream before reusing its buffer
+            current_stream.synchronize()?;
+
+            current_buffer.copy_from_slice(chunk_data)?;
+            let dst_ptr = (gpu_ptr + offset) as *mut c_void;
+            memcpy_h2d_async(dst_ptr, current_buffer.as_ptr(), chunk_data.len(), current_stream)?;
+
+            offset = end;
+        }
+
+        // Wait for all transfers to complete
+        stream_a.synchronize()?;
+        stream_b.synchronize()?;
+
+        self.pinned_pool.release(buffer_a);
+        self.pinned_pool.release(buffer_b);
+
+        Ok(())
+    }
+
     fn load_sequential(&self, safetensors: &SafeTensors, tensors: &mut HashMap<String, GpuTensor>) -> GpuResult<()> {
         for (name, view) in safetensors.iter() {
             let gpu_tensor = GpuTensor::new(&self.device, view.dtype(), view.shape().to_vec())?;
-            let stream = self.stream_pool.next_stream();
-            let mut pinned = self.pinned_pool.acquire(view.data().len())?;
-            pinned.copy_from_slice(view.data())?;
-            memcpy_h2d_async(gpu_tensor.as_ptr(), pinned.as_ptr(), view.data().len(), stream)?;
-            self.pinned_pool.release(pinned);
+            let data = view.data();
+
+            // Use chunked transfer for large tensors
+            if data.len() > self.config.max_chunk_size {
+                self.transfer_chunked(&gpu_tensor, data)?;
+            } else {
+                let stream = self.stream_pool.next_stream();
+                let mut pinned = self.pinned_pool.acquire(data.len())?;
+                pinned.copy_from_slice(data)?;
+                memcpy_h2d_async(gpu_tensor.as_ptr(), pinned.as_ptr(), data.len(), stream)?;
+                self.pinned_pool.release(pinned);
+            }
             tensors.insert(name.to_string(), gpu_tensor);
         }
         Ok(())
@@ -247,7 +324,12 @@ impl GpuLoader {
         let tensor_list: Vec<_> = safetensors.iter().collect();
         if tensor_list.is_empty() { return Ok(()); }
 
-        let max_size = tensor_list.iter().map(|(_, v)| v.data().len()).max().unwrap_or(0);
+        // Cap buffer size at max_chunk_size for memory efficiency
+        let max_size = tensor_list.iter()
+            .map(|(_, v)| v.data().len())
+            .max()
+            .unwrap_or(0)
+            .min(self.config.max_chunk_size);
         let mut buffer_a = self.pinned_pool.acquire(max_size)?;
         let mut buffer_b = self.pinned_pool.acquire(max_size)?;
 
@@ -261,8 +343,22 @@ impl GpuLoader {
 
         if let Some((name, view)) = tensor_list.first() {
             let gpu_tensor = GpuTensor::new(&self.device, view.dtype(), view.shape().to_vec())?;
-            current_buffer.copy_from_slice(view.data())?;
-            memcpy_h2d_async(gpu_tensor.as_ptr(), current_buffer.as_ptr(), view.data().len(), current_stream)?;
+            let data = view.data();
+
+            if data.len() > self.config.max_chunk_size {
+                // Release buffers temporarily and use chunked transfer
+                self.pinned_pool.release(buffer_a);
+                self.pinned_pool.release(buffer_b);
+                self.transfer_chunked(&gpu_tensor, data)?;
+                // Re-acquire buffers for remaining tensors
+                buffer_a = self.pinned_pool.acquire(max_size)?;
+                buffer_b = self.pinned_pool.acquire(max_size)?;
+                current_buffer = &mut buffer_a;
+                other_buffer = &mut buffer_b;
+            } else {
+                current_buffer.copy_from_slice(data)?;
+                memcpy_h2d_async(gpu_tensor.as_ptr(), current_buffer.as_ptr(), data.len(), current_stream)?;
+            }
             tensors.insert(name.to_string(), gpu_tensor);
         }
 
@@ -271,9 +367,17 @@ impl GpuLoader {
             std::mem::swap(&mut current_stream, &mut other_stream);
 
             let gpu_tensor = GpuTensor::new(&self.device, view.dtype(), view.shape().to_vec())?;
-            current_stream.synchronize()?;
-            current_buffer.copy_from_slice(view.data())?;
-            memcpy_h2d_async(gpu_tensor.as_ptr(), current_buffer.as_ptr(), view.data().len(), current_stream)?;
+            let data = view.data();
+
+            if data.len() > self.config.max_chunk_size {
+                // Use chunked transfer for large tensors
+                current_stream.synchronize()?;
+                self.transfer_chunked(&gpu_tensor, data)?;
+            } else {
+                current_stream.synchronize()?;
+                current_buffer.copy_from_slice(data)?;
+                memcpy_h2d_async(gpu_tensor.as_ptr(), current_buffer.as_ptr(), data.len(), current_stream)?;
+            }
             tensors.insert(name.to_string(), gpu_tensor);
         }
 

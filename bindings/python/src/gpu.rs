@@ -331,17 +331,18 @@ pub fn load_to_torch(
 
     #[cfg(feature = "gpu")]
     {
-        use safetensors::gpu::{GpuLoader, GpuLoaderConfig as RustConfig};
+        use safetensors::gpu::low_level::{CudaDevice, CudaStream, host_alloc, host_free, HostAllocFlags};
 
-        let rust_config = RustConfig {
-            num_streams: config.num_streams,
-            max_pinned_memory: config.max_pinned_memory,
-            device_id: config.device_id,
-            double_buffer: config.double_buffer,
-            ..Default::default()
-        };
+        // Set the CUDA device
+        let cuda_device = CudaDevice::new(device_id)
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+        cuda_device.set_current()
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
 
-        let loader = GpuLoader::new(rust_config)
+        // Create CUDA streams for async transfers
+        let stream1 = CudaStream::new()
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+        let stream2 = CudaStream::new()
             .map_err(|e| GpuError::new_err(e.to_string()))?;
 
         // Open and parse the safetensors file
@@ -363,27 +364,34 @@ pub fn load_to_torch(
         let torch = PyModule::import(py, "torch")?;
         let result = PyDict::new(py);
 
+        // CUDA FFI
         extern "C" {
-            fn cudaDeviceSynchronize() -> i32;
-            fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
-            fn cudaFree(ptr: *mut std::ffi::c_void) -> i32;
+            fn cudaMemcpyAsync(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32, stream: *mut std::ffi::c_void) -> i32;
         }
+        const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
 
-        // Process tensors one at a time to minimize memory usage
+        // Allocate pinned buffers for double-buffering
+        let chunk_size = 256 << 20; // 256MB chunks
+        let pinned_buf1 = host_alloc(chunk_size, HostAllocFlags::default())
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+        let pinned_buf2 = host_alloc(chunk_size, HostAllocFlags::default())
+            .map_err(|e| GpuError::new_err(e.to_string()))?;
+
+        let mut current_buf = pinned_buf1;
+        let mut other_buf = pinned_buf2;
+        let mut current_stream = &stream1;
+        let mut other_stream = &stream2;
+
+        // Process each tensor
         for name in names_to_load {
-            // Load single tensor to GPU
-            let gpu_tensors = loader.load_tensors(&safetensors, &[name.as_str()])
+            let view = safetensors.tensor(&name)
                 .map_err(|e| GpuError::new_err(e.to_string()))?;
 
-            let (_, gpu_tensor) = gpu_tensors.into_iter().next()
-                .ok_or_else(|| GpuError::new_err(format!("Tensor '{}' not found", name)))?;
+            let dtype_str = format!("{:?}", view.dtype());
+            let shape: Vec<usize> = view.shape().to_vec();
+            let data = view.data();
 
-            let dtype_str = format!("{:?}", gpu_tensor.dtype());
-            let shape = gpu_tensor.shape().to_vec();
-            let size_bytes = gpu_tensor.size_bytes();
-            let src_ptr = gpu_tensor.as_ptr();
-
-            // Map dtype string to torch dtype
+            // Map dtype to torch dtype
             let torch_dtype = match dtype_str.as_str() {
                 "F32" => torch.getattr("float32")?,
                 "F64" => torch.getattr("float64")?,
@@ -411,42 +419,73 @@ pub fn load_to_torch(
             let tensor = torch.call_method("empty", (shape_list,), Some(&kwargs))?;
 
             // Skip zero-sized tensors
-            if size_bytes == 0 {
+            if data.is_empty() {
                 result.set_item(&name, tensor)?;
                 continue;
             }
 
-            // Get the data pointer of the new tensor
+            // Get the data pointer of the PyTorch tensor
             let tensor_data_ptr: u64 = tensor
                 .call_method0("data_ptr")?
                 .extract()?;
 
-            // Synchronize before copy to ensure source data is ready
-            unsafe { cudaDeviceSynchronize() };
+            // Copy data directly from file (via mmap) to PyTorch tensor using pinned memory
+            let mut offset = 0usize;
+            while offset < data.len() {
+                let end = (offset + chunk_size).min(data.len());
+                let chunk_len = end - offset;
 
-            // Copy from our GPU buffer to PyTorch tensor
-            const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
-            let memcpy_result = unsafe {
-                cudaMemcpy(
-                    tensor_data_ptr as *mut std::ffi::c_void,
-                    src_ptr as *const std::ffi::c_void,
-                    size_bytes,
-                    CUDA_MEMCPY_DEVICE_TO_DEVICE,
-                )
-            };
+                // Wait for previous transfer on this stream/buffer to complete
+                current_stream.synchronize()
+                    .map_err(|e| GpuError::new_err(e.to_string()))?;
 
-            if memcpy_result != 0 {
-                return Err(GpuError::new_err(format!(
-                    "cudaMemcpy device-to-device failed with error code {}",
-                    memcpy_result
-                )));
+                // Copy chunk to pinned buffer
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data[offset..end].as_ptr(),
+                        current_buf as *mut u8,
+                        chunk_len,
+                    );
+                }
+
+                // Async copy from pinned buffer to GPU
+                let dst_ptr = (tensor_data_ptr as usize + offset) as *mut std::ffi::c_void;
+                let result = unsafe {
+                    cudaMemcpyAsync(
+                        dst_ptr,
+                        current_buf as *const std::ffi::c_void,
+                        chunk_len,
+                        CUDA_MEMCPY_HOST_TO_DEVICE,
+                        current_stream.raw(),
+                    )
+                };
+                if result != 0 {
+                    // Clean up pinned memory before returning error
+                    let _ = host_free(current_buf, chunk_size);
+                    let _ = host_free(other_buf, chunk_size);
+                    return Err(GpuError::new_err(format!(
+                        "cudaMemcpyAsync failed with error code {}",
+                        result
+                    )));
+                }
+
+                // Swap buffers and streams for double-buffering
+                std::mem::swap(&mut current_buf, &mut other_buf);
+                std::mem::swap(&mut current_stream, &mut other_stream);
+
+                offset = end;
             }
 
-            // Free the source GPU memory immediately after copy
-            // gpu_tensor will be dropped here, freeing its memory
+            // Wait for all transfers for this tensor to complete
+            stream1.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
+            stream2.synchronize().map_err(|e| GpuError::new_err(e.to_string()))?;
 
             result.set_item(&name, tensor)?;
         }
+
+        // Clean up pinned memory
+        host_free(current_buf, chunk_size).map_err(|e| GpuError::new_err(e.to_string()))?;
+        host_free(other_buf, chunk_size).map_err(|e| GpuError::new_err(e.to_string()))?;
 
         Ok(result.into())
     }

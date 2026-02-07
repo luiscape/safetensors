@@ -102,16 +102,40 @@ class GpuLoaderConfig:
         Create a high-performance configuration.
 
         This configuration uses more resources for maximum throughput:
-        - 8 CUDA streams
-        - 1GB pinned memory
+        - 32 CUDA streams
+        - 2GB pinned memory
         - Double buffering enabled
 
         Returns:
             GpuLoaderConfig: High-performance configuration.
         """
         return cls(
-            num_streams=8,
-            max_pinned_memory_mb=1024,
+            num_streams=32,
+            max_pinned_memory_mb=2048,
+            device_id=0,
+            double_buffer=True,
+        )
+
+    @classmethod
+    def max_performance(cls) -> "GpuLoaderConfig":
+        """
+        Create a maximum performance configuration.
+
+        This configuration uses even more resources for maximum throughput
+        on high-end GPUs:
+        - 64 CUDA streams
+        - 4GB pinned memory
+        - Double buffering enabled
+
+        Note: Uses significant pinned memory. Only use if you have
+        sufficient system RAM.
+
+        Returns:
+            GpuLoaderConfig: Maximum performance configuration.
+        """
+        return cls(
+            num_streams=64,
+            max_pinned_memory_mb=4096,
             device_id=0,
             double_buffer=True,
         )

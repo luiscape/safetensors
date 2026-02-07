@@ -55,12 +55,24 @@ impl GpuLoaderConfig {
         }
     }
 
-    /// Create a high-performance configuration.
+    /// Create a high-performance configuration (32 streams).
     #[staticmethod]
     fn high_performance() -> Self {
         Self {
-            num_streams: 8,
-            max_pinned_memory: 1 << 30, // 1GB
+            num_streams: 32,
+            max_pinned_memory: 2 << 30, // 2GB
+            device_id: 0,
+            double_buffer: true,
+        }
+    }
+
+    /// Create a maximum performance configuration (64 streams).
+    /// Uses more pinned memory but may provide better throughput on high-end GPUs.
+    #[staticmethod]
+    fn max_performance() -> Self {
+        Self {
+            num_streams: 64,
+            max_pinned_memory: 4usize << 30, // 4GB
             device_id: 0,
             double_buffer: true,
         }

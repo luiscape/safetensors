@@ -343,7 +343,7 @@ pub fn load_to_torch(
 
     #[cfg(feature = "gpu")]
     {
-        use safetensors::gpu::low_level::{CudaDevice, CudaStream};
+        use safetensors::gpu::low_level::CudaDevice;
 
         // Set the CUDA device
         let cuda_device = CudaDevice::new(device_id)
@@ -351,9 +351,7 @@ pub fn load_to_torch(
         cuda_device.set_current()
             .map_err(|e| GpuError::new_err(e.to_string()))?;
 
-        // Create a single CUDA stream for all transfers
-        let stream = CudaStream::new()
-            .map_err(|e| GpuError::new_err(e.to_string()))?;
+
 
         // Open and parse the safetensors file
         let file = std::fs::File::open(&filename)
@@ -374,13 +372,22 @@ pub fn load_to_torch(
         let torch = PyModule::import(py, "torch")?;
         let result = PyDict::new(py);
 
-        // CUDA FFI - use async memcpy with a single stream
+        // CUDA FFI
         extern "C" {
-            fn cudaMemcpyAsync(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32, stream: *mut std::ffi::c_void) -> i32;
+            fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
         }
         const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
 
-        // Create all tensors and queue all transfers
+        // First pass: collect all tensor metadata and create PyTorch tensors
+        struct TensorTransfer {
+            name: String,
+            dst_ptr: u64,
+            src_offset: usize,
+            len: usize,
+        }
+        let mut transfers: Vec<TensorTransfer> = Vec::with_capacity(names_to_load.len());
+        let mmap_base = mmap.as_ptr() as usize;
+
         for name in &names_to_load {
             let view = safetensors.tensor(name)
                 .map_err(|e| GpuError::new_err(e.to_string()))?;
@@ -418,32 +425,41 @@ pub fn load_to_torch(
 
             if !data.is_empty() {
                 let dst_ptr: u64 = tensor.call_method0("data_ptr")?.extract()?;
-
-                // Queue async copy - all transfers go to the same stream
-                let err = unsafe {
-                    cudaMemcpyAsync(
-                        dst_ptr as *mut std::ffi::c_void,
-                        data.as_ptr() as *const std::ffi::c_void,
-                        data.len(),
-                        CUDA_MEMCPY_HOST_TO_DEVICE,
-                        stream.raw(),
-                    )
-                };
-
-                if err != 0 {
-                    return Err(GpuError::new_err(format!(
-                        "cudaMemcpyAsync failed with error code {} for tensor '{}'",
-                        err, name
-                    )));
-                }
+                let src_offset = data.as_ptr() as usize - mmap_base;
+                transfers.push(TensorTransfer {
+                    name: name.clone(),
+                    dst_ptr,
+                    src_offset,
+                    len: data.len(),
+                });
             }
 
             result.set_item(name, tensor)?;
         }
 
-        // Single sync at the end - wait for all transfers to complete
-        stream.synchronize()
-            .map_err(|e| GpuError::new_err(e.to_string()))?;
+        // Second pass: do all memcpy operations with GIL released
+        // This allows other Python threads to run during the transfers
+        let mmap_ptr = mmap.as_ptr();
+        py.allow_threads(|| -> Result<(), String> {
+            for transfer in &transfers {
+                let src_ptr = unsafe { mmap_ptr.add(transfer.src_offset) };
+                let err = unsafe {
+                    cudaMemcpy(
+                        transfer.dst_ptr as *mut std::ffi::c_void,
+                        src_ptr as *const std::ffi::c_void,
+                        transfer.len,
+                        CUDA_MEMCPY_HOST_TO_DEVICE,
+                    )
+                };
+                if err != 0 {
+                    return Err(format!(
+                        "cudaMemcpy failed with error code {} for tensor '{}'",
+                        err, transfer.name
+                    ));
+                }
+            }
+            Ok(())
+        }).map_err(|e| GpuError::new_err(e))?;
 
         Ok(result.into())
     }

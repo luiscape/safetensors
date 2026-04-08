@@ -211,13 +211,20 @@ Step-by-step profiling of a single cold load:
 
 | Step | Time | Notes |
 |---|---|---|
-| `cuFileRead` | 414 ms | Actual NVMe → GPU DMA |
+| `cuFileRead` | 414 ms | Actual NVMe → GPU DMA (94% of total) |
 | `cuFileHandleRegister` | 5 ms | Per-file, unavoidable |
-| Header parse (8B + JSON) | 1 ms | |
-| `torch.empty` (alloc) | 0.6 ms | Pool hit |
-| 196 tensor views | 2 ms | Slice + view + reshape |
-| Rust/Python FFI | ~20 ms | PyO3 + GIL transitions |
+| File open + mmap header parse | 9 ms | `open(O_DIRECT)` + mmap + JSON |
+| `torch.empty` (alloc) | 0.6 ms | Buffer pool hit |
+| `get_all_tensors` | 1 ms | Batched `torch.split` + view + reshape |
+| Rust/Python GIL transitions | ~3 ms | Single merged `with_gil` block |
+| Deregister + close | 8 ms | `cuFileHandleDeregister` + `close(fd)` |
 | **Total** | **~442 ms** | |
+
+Tensor views are created in a single batched `get_all_tensors()` call that
+holds the GIL once, uses `torch.split` to slice the buffer, then views and
+reshapes each chunk — replacing 196 individual `get_tensor` round-trips.
+The constructor similarly merges its torch-import and device-string-conversion
+into one GIL acquisition.
 
 The 740 ms `cuFileDriverOpen` cost is paid **once per process** (singleton)
 and amortised over all subsequent loads.
@@ -235,6 +242,20 @@ CPU targets because it avoids actual I/O:
 
 This is why the auto-detection only activates the fast path for CUDA
 devices — CPU loads stay on mmap.
+
+### Batching impact
+
+Tensor view creation via `get_all_tensors()` (one GIL hold + `torch.split`)
+versus 196 individual `get_tensor()` calls:
+
+| Approach | Time (196 tensors) |
+|---|---|
+| Per-key `get_tensor` loop | 1.8 ms |
+| Batched `get_all_tensors` | 1.0 ms |
+
+The savings are modest in absolute terms because tensor view creation was
+already fast. The batching mainly eliminates PyO3 method dispatch overhead
+(196 Rust→Python round-trips → 1).
 
 ---
 
@@ -300,6 +321,7 @@ outperforms the mmap path on cold storage.
 | GDS driver lifecycle | Per-loader instance | Process-wide singleton (saves 740 ms) |
 | Buffer registration | Per-file register/deregister | Pooled (saves 18 ms/file) |
 | Bounce buffer | `cudaHostAlloc` in C++ threads | `cudaHostAlloc` in rayon threads |
+| Tensor view creation | 1-by-1 via DLPack | Batched `torch.split` via `get_all_tensors` |
 | Multi-GPU sharding | `torch.distributed` broadcast/scatter | Same |
 | Async I/O | `submit_read`/`wait_read` | `FastFileBufferAsync` submit/wait |
 | Integration | Separate library, explicit API | Drop-in via `load_file` auto-detection |

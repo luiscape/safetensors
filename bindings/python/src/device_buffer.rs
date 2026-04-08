@@ -296,7 +296,7 @@ pub fn fix_alignment(
 
 /// Converts a safetensors dtype string (e.g. `"F32"`, `"BF16"`) to the
 /// corresponding `torch.dtype` Python object.
-fn safetensors_dtype_to_torch<'py>(
+pub(crate) fn safetensors_dtype_to_torch<'py>(
     _py: Python<'py>,
     torch: &Bound<'py, PyModule>,
     dtype_str: &str,

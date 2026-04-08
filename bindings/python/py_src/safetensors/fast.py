@@ -1752,7 +1752,6 @@ def fast_load_file(
         try:
             from safetensors._safetensors_rust import fast_safe_open
 
-            result: Dict[str, Any] = {}
             with fast_safe_open(
                 filename,
                 device=device,
@@ -1760,9 +1759,9 @@ def fast_load_file(
                 max_threads=max_threads,
                 bounce_buffer_size_kb=bounce_buffer_size_kb,
             ) as f:
-                for key in f.keys():
-                    result[key] = f.get_tensor(key)
-            return result
+                # Single batched call — one GIL hold, one torch.split,
+                # instead of N individual get_tensor round-trips.
+                return f.get_all_tensors()
         except Exception:
             pass  # fall through to the Python path
 

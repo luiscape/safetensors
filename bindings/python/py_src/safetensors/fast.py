@@ -1718,7 +1718,7 @@ class fast_open:
 def fast_load_file(
     filename: str,
     device: str = "cpu",
-    nogds: bool = True,
+    nogds: bool = False,
     max_threads: int = 16,
     bounce_buffer_size_kb: int = 16384,
 ) -> Dict[str, "torch.Tensor"]:
@@ -1728,16 +1728,45 @@ def fast_load_file(
     file body is read in a single pass (with parallel I/O) into a
     contiguous device buffer; individual tensors are zero-copy views.
 
+    When the target device is a CUDA GPU, this function first attempts to
+    use the Rust ``fast_safe_open`` backend which supports GPU Direct
+    Storage (GDS) with a singleton cuFile driver and pre-registered buffer
+    pool.  If that is unavailable or fails, it falls back to the pure-Python
+    parallel-pread path.
+
     Args:
         filename: path to the ``.safetensors`` file.
         device: target device (e.g. ``"cpu"``, ``"cuda:0"``).
-        nogds: if ``True``, use pread + bounce buffer instead of GDS.
+        nogds: if ``True``, skip GDS and use pread + bounce buffer.
+            Defaults to ``False`` (attempt GDS first).
         max_threads: number of parallel I/O threads.
         bounce_buffer_size_kb: bounce buffer size in KiB.
 
     Returns:
         ``Dict[str, torch.Tensor]``
     """
+    # ---- Rust fast_safe_open path (GDS with singleton driver) --------
+    # This is the highest-throughput path: cuFileRead with a cached
+    # cuFile driver and a pre-registered GPU buffer pool.
+    if not nogds:
+        try:
+            from safetensors._safetensors_rust import fast_safe_open
+
+            result: Dict[str, Any] = {}
+            with fast_safe_open(
+                filename,
+                device=device,
+                nogds=False,
+                max_threads=max_threads,
+                bounce_buffer_size_kb=bounce_buffer_size_kb,
+            ) as f:
+                for key in f.keys():
+                    result[key] = f.get_tensor(key)
+            return result
+        except Exception:
+            pass  # fall through to the Python path
+
+    # ---- Python path (parallel pread + bounce buffer) ----------------
     result: Dict[str, Any] = {}
     with fast_open(
         filename,

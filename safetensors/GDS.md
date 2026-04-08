@@ -186,23 +186,23 @@ overhead is < 1 ms.
 ### Benchmark: 1,353 MB safetensors file, 196 tensors, cold NVMe
 
 Page cache dropped (`echo 3 > /proc/sys/vm/drop_caches`) before every
-iteration. 5 iterations per method.
+iteration. 7 iterations per method, clean process (no module reloads).
 
 | Method | API Call | Time | Throughput | NVMe Ceiling |
 |---|---|---|---|---|
-| **safetensors mmap** (baseline) | `load_file(f, device="cuda:0")` | 722 ms | 1,874 MB/s | 55% |
-| **fastsafetensors GDS** (paper) | `SafeTensorsFileLoader(nogds=False)` | 533 ms | 2,542 MB/s | 75% |
-| **This implementation** (auto) | `load_file(f, device="cuda:0")` | 442 ms | 3,062 MB/s | 90% |
-| cuFileRead raw (floor) | Direct FFI, no tensor views | 414 ms | 3,265 MB/s | 96% |
+| **safetensors mmap** (baseline) | `load_file(f, device="cuda:0")` | 718 ms | 1,885 MB/s | 55% |
+| **fastsafetensors GDS** (paper) | `SafeTensorsFileLoader(nogds=False)` | 504 ms | 2,683 MB/s | 79% |
+| **This implementation** (auto) | `load_file(f, device="cuda:0")` | 428 ms | 3,164 MB/s | 93% |
+| cuFileRead raw (floor) | Direct FFI, no tensor views | 414 ms | 3,272 MB/s | 96% |
 
 ### Speedup
 
 ```
-load_file on CUDA:  1.63× faster  (722 ms → 442 ms)
+load_file on CUDA:  1.68× faster  (718 ms → 428 ms)
 
-vs fastsafetensors: 1.21× faster  (533 ms → 442 ms)
+vs fastsafetensors: 1.18× faster  (504 ms → 428 ms)
 
-NVMe utilisation:   55% → 90%
+NVMe utilisation:   55% → 93%
 ```
 
 ### Where the remaining 10% goes
@@ -211,14 +211,14 @@ Step-by-step profiling of a single cold load:
 
 | Step | Time | Notes |
 |---|---|---|
-| `cuFileRead` | 414 ms | Actual NVMe → GPU DMA (94% of total) |
+| `cuFileRead` | 414 ms | Actual NVMe → GPU DMA (97% of total) |
 | `cuFileHandleRegister` | 5 ms | Per-file, unavoidable |
-| File open + mmap header parse | 9 ms | `open(O_DIRECT)` + mmap + JSON |
-| `torch.empty` (alloc) | 0.6 ms | Buffer pool hit |
+| File open + mmap header parse | 2 ms | `open(O_DIRECT)` + mmap + JSON |
+| `torch.empty` (alloc) | 0.1 ms | Buffer pool hit |
 | `get_all_tensors` | 1 ms | Batched `torch.split` + view + reshape |
 | Rust/Python GIL transitions | ~3 ms | Single merged `with_gil` block |
-| Deregister + close | 8 ms | `cuFileHandleDeregister` + `close(fd)` |
-| **Total** | **~442 ms** | |
+| Deregister + close | 3 ms | `cuFileHandleDeregister` + `close(fd)` |
+| **Total** | **~428 ms** | |
 
 Tensor views are created in a single batched `get_all_tensors()` call that
 holds the GIL once, uses `torch.split` to slice the buffer, then views and
@@ -226,7 +226,7 @@ reshapes each chunk — replacing 196 individual `get_tensor` round-trips.
 The constructor similarly merges its torch-import and device-string-conversion
 into one GIL acquisition.
 
-The 740 ms `cuFileDriverOpen` cost is paid **once per process** (singleton)
+The ~740 ms `cuFileDriverOpen` cost is paid **once per process** (singleton)
 and amortised over all subsequent loads.
 
 ### Warm page cache comparison
@@ -253,9 +253,12 @@ versus 196 individual `get_tensor()` calls:
 | Per-key `get_tensor` loop | 1.8 ms |
 | Batched `get_all_tensors` | 1.0 ms |
 
-The savings are modest in absolute terms because tensor view creation was
+The savings are modest in absolute terms because tensor view creation is
 already fast. The batching mainly eliminates PyO3 method dispatch overhead
-(196 Rust→Python round-trips → 1).
+(196 Rust→Python round-trips → 1). On cold NVMe the cuFileRead (414 ms)
+dominates, so these milliseconds are within the noise floor — but the
+improvement matters for warm-cache or smaller-file scenarios where
+overhead is a larger fraction of total time.
 
 ---
 
@@ -325,7 +328,7 @@ outperforms the mmap path on cold storage.
 | Multi-GPU sharding | `torch.distributed` broadcast/scatter | Same |
 | Async I/O | `submit_read`/`wait_read` | `FastFileBufferAsync` submit/wait |
 | Integration | Separate library, explicit API | Drop-in via `load_file` auto-detection |
-| Throughput (1.3 GB, cold NVMe) | 2,542 MB/s (75% ceiling) | 3,062 MB/s (90% ceiling) |
+| Throughput (1.3 GB, cold NVMe) | 2,683 MB/s (79% ceiling) | 3,164 MB/s (93% ceiling) |
 
 ---
 

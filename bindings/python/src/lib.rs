@@ -9,6 +9,8 @@ use pyo3::types::IntoPyDict;
 use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyList, PySlice};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
+#[allow(unused_imports)]
+use safetensors::bulk_io::{compute_alignment_fixups, BulkReadPlan};
 use safetensors::slice::TensorIndexer;
 use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
 use safetensors::View;
@@ -19,6 +21,11 @@ use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
+
+mod bulk_reader;
+#[cfg(feature = "gds")]
+mod cuda_runtime;
+mod device_buffer;
 
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -1655,6 +1662,474 @@ impl _safe_open_handle {
     }
 }
 
+/// Storage for fast-path: holds the metadata, device buffer, and bulk reader.
+#[allow(dead_code)]
+struct FastOpen {
+    /// Parsed safetensors metadata.
+    metadata: Metadata,
+    /// Header size in bytes (offset to body start).
+    header_size: usize,
+    /// Device buffer holding the file body on the target device.
+    device_buf: device_buffer::DeviceBuffer,
+    /// Target device string.
+    device: Device,
+    /// Framework (only Pytorch is supported for fast_open).
+    framework: Framework,
+}
+
+impl FastOpen {
+    fn new(
+        filename: PathBuf,
+        device: Option<Device>,
+        max_threads: usize,
+        bounce_buffer_size_kb: usize,
+        nogds: bool,
+    ) -> PyResult<Self> {
+        let device = device.unwrap_or(Device::Cpu);
+        let framework = Framework::Pytorch;
+
+        // Read and parse the header using mmap (header is small).
+        let file = File::open(&filename).map_err(|_| {
+            PyFileNotFoundError::new_err(format!(
+                "No such file or directory: {}",
+                filename.display()
+            ))
+        })?;
+        let buffer = unsafe { MmapOptions::new().map_copy_read_only(&file)? };
+        let _file_size = buffer.len();
+        let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
+            SafetensorError::new_err(format!("Error while deserializing header: {e}"))
+        })?;
+        let header_size = n + 8;
+        let body_size = metadata.data_len();
+
+        // Drop the mmap — we no longer need it.
+        drop(buffer);
+        drop(file);
+
+        // Ensure torch is imported.
+        Python::with_gil(|py| -> PyResult<()> {
+            let module = PyModule::import(py, intern!(py, "torch"))?;
+            TORCH_MODULE.get_or_init_py_attached(py, || module.into());
+            Ok(())
+        })?;
+
+        // Allocate device buffer.
+        let device_str = Python::with_gil(|py| -> PyResult<String> {
+            let d: PyObject = device.clone().into_pyobject(py)?.into();
+            d.extract::<String>(py)
+        })?;
+
+        let _plan = BulkReadPlan::from_metadata(&metadata, header_size, None);
+        let path_str = filename.to_str().ok_or_else(|| {
+            SafetensorError::new_err(format!("Path {} is not valid UTF-8", filename.display()))
+        })?;
+
+        // Read the file body into the device buffer.
+        let reader = bulk_reader::BulkFileReader::new(max_threads, bounce_buffer_size_kb);
+
+        let _is_gpu = matches!(device, Device::Cuda(_));
+
+        #[cfg(feature = "gds")]
+        let gds_available = !nogds && _is_gpu;
+        #[cfg(not(feature = "gds"))]
+        let gds_available = {
+            let _ = nogds;
+            false
+        };
+
+        if gds_available {
+            #[cfg(feature = "gds")]
+            {
+                let gds_succeeded = (|| -> Result<device_buffer::DeviceBuffer, String> {
+                    // Check if GPU supports GDS via CUDA runtime query.
+                    // Safety: CudaContext::new loads libcudart.so symbols at runtime.
+                    let cuda_ctx = unsafe { device_buffer::CudaContext::new() }
+                        .map_err(|e| format!("Failed to init CUDA context: {e}"))?;
+
+                    let device_id = match &device {
+                        Device::Cuda(id) => *id as i32,
+                        _ => 0,
+                    };
+
+                    if !cuda_ctx.is_gds_supported(device_id)? {
+                        return Err("GPU does not support GPUDirect RDMA".into());
+                    }
+
+                    // Use the process-wide cached GDS driver singleton — avoids
+                    // the ~743 ms cuFileDriverOpen() cost on every file load.
+                    let gds = device_buffer::get_gds_context()
+                        .map_err(|e| format!("Failed to init GDS: {e}"))?;
+
+                    // Acquire a pre-registered buffer from the pool — avoids
+                    // ~18 ms of cuFileBufRegister / cuFileBufDeregister per file.
+                    let device_buf = Python::with_gil(|py| {
+                        device_buffer::GdsBufferPool::acquire(py, body_size, &device_str)
+                    })
+                    .map_err(|e| format!("GDS buffer pool acquire failed: {e}"))?;
+
+                    let dev_ptr = device_buf.data_ptr as *mut std::ffi::c_void;
+                    // Safety: dev_ptr is a valid CUDA device pointer from
+                    // GdsBufferPool::acquire with at least body_size bytes,
+                    // and the buffer is already registered with cuFile.
+                    unsafe {
+                        device_buffer::gds_read_file_body_pooled(
+                            gds,
+                            path_str,
+                            header_size,
+                            body_size,
+                            dev_ptr,
+                            0,
+                        )?;
+                    }
+
+                    // Don't close the driver — it's a process-wide singleton.
+                    Ok(device_buf)
+                })();
+
+                match gds_succeeded {
+                    Ok(device_buf) => {
+                        // GDS handles file-offset alignment internally via
+                        // aligned reads + dev_offset.  The only remaining
+                        // concern is dtype alignment (e.g. a float32 tensor
+                        // starting at a non-4-byte-aligned offset within the
+                        // body).  This is the same 8-byte check that the
+                        // non-GDS path uses — apply it here too.
+                        if !metadata.is_aligned(header_size, 8) {
+                            let fixups_raw = compute_alignment_fixups(&metadata, header_size, 8);
+                            if !fixups_raw.is_empty() {
+                                Python::with_gil(|py| -> PyResult<()> {
+                                    let fixups: Vec<(usize, usize, usize)> = fixups_raw
+                                        .iter()
+                                        .map(|f| (f.current_offset, f.aligned_offset, f.length))
+                                        .collect();
+                                    device_buffer::fix_alignment(py, &device_buf, &fixups)?;
+                                    Ok(())
+                                })?;
+                            }
+                        }
+
+                        // GDS path succeeded — skip the non-GDS path.
+                        return Ok(Self {
+                            metadata,
+                            header_size,
+                            device_buf,
+                            device,
+                            framework,
+                        });
+                    }
+                    Err(_e) => {
+                        // GDS failed — fall through to the pread + bounce-buffer path.
+                        // In a debug build you could: eprintln!("GDS fallback: {_e}");
+                    }
+                }
+            }
+        }
+
+        // Allocate the device buffer for the non-GDS fallback path.
+        let device_buf = Python::with_gil(|py| {
+            device_buffer::allocate_device_buffer(py, body_size, &device_str)
+        })?;
+
+        {
+            // Try direct cudaMemcpy path for GPU devices (no GIL needed).
+            #[cfg(feature = "gds")]
+            let used_direct = if _is_gpu {
+                if let Some(cuda) = cuda_runtime::CudaRuntime::get() {
+                    let device_id = match &device {
+                        Device::Cuda(id) => *id as i32,
+                        _ => 0,
+                    };
+                    let dev_ptr = device_buf.data_ptr as *mut std::ffi::c_void;
+                    reader
+                        .read_file_to_gpu_direct(
+                            cuda,
+                            path_str,
+                            header_size,
+                            body_size,
+                            dev_ptr,
+                            device_id,
+                        )
+                        .map_err(|e| {
+                            SafetensorError::new_err(format!("Direct GPU read failed: {e}"))
+                        })?;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            #[cfg(not(feature = "gds"))]
+            let used_direct = false;
+
+            // Fallback: CPU or GPU without direct CUDA — use pread + bounce buffer path.
+            if !used_direct {
+                Python::with_gil(|py| -> PyResult<()> {
+                    reader
+                        .read_file_to_device_buffer(
+                            py,
+                            path_str,
+                            header_size,
+                            body_size,
+                            &device_buf,
+                            0,
+                        )
+                        .map_err(|e| SafetensorError::new_err(format!("Bulk read failed: {e}")))?;
+                    Ok(())
+                })?;
+            }
+
+            // Check and fix 8-byte alignment for non-GDS reads (tensor dtype alignment).
+            if !metadata.is_aligned(header_size, 8) {
+                let fixups_raw = compute_alignment_fixups(&metadata, header_size, 8);
+                if !fixups_raw.is_empty() {
+                    Python::with_gil(|py| -> PyResult<()> {
+                        let fixups: Vec<(usize, usize, usize)> = fixups_raw
+                            .iter()
+                            .map(|f| (f.current_offset, f.aligned_offset, f.length))
+                            .collect();
+                        device_buffer::fix_alignment(py, &device_buf, &fixups)?;
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+
+        Ok(Self {
+            metadata,
+            header_size,
+            device_buf,
+            device,
+            framework,
+        })
+    }
+
+    fn metadata(&self) -> Option<HashMap<String, String>> {
+        self.metadata.metadata().clone()
+    }
+
+    fn keys(&self) -> PyResult<Vec<String>> {
+        Ok(self.metadata.tensors().keys().cloned().collect())
+    }
+
+    fn offset_keys(&self) -> PyResult<Vec<String>> {
+        Ok(self.metadata.offset_keys())
+    }
+
+    fn get_tensor(&self, name: &str) -> PyResult<PyObject> {
+        let info = self.metadata.info(name).ok_or_else(|| {
+            SafetensorError::new_err(format!("File does not contain tensor {name}"))
+        })?;
+
+        Python::with_gil(|py| {
+            device_buffer::create_tensor_view(
+                py,
+                &self.device_buf,
+                info.data_offsets.0,
+                info.data_offsets.1 - info.data_offsets.0,
+                &dtype_to_str(info.dtype),
+                info.shape.clone(),
+            )
+        })
+    }
+
+    fn body_size(&self) -> usize {
+        self.metadata.data_len()
+    }
+
+    fn is_aligned(&self, alignment: usize) -> bool {
+        self.metadata.is_aligned(self.header_size, alignment)
+    }
+}
+
+/// Convert a safetensors Dtype to the string expected by
+/// [`device_buffer::create_tensor_view`].
+fn dtype_to_str(dtype: Dtype) -> String {
+    match dtype {
+        Dtype::BOOL => "bool".to_string(),
+        Dtype::U8 => "uint8".to_string(),
+        Dtype::I8 => "int8".to_string(),
+        Dtype::I16 => "int16".to_string(),
+        Dtype::I32 => "int32".to_string(),
+        Dtype::I64 => "int64".to_string(),
+        Dtype::F16 => "float16".to_string(),
+        Dtype::BF16 => "bfloat16".to_string(),
+        Dtype::F32 => "float32".to_string(),
+        Dtype::F64 => "float64".to_string(),
+        Dtype::U16 => "uint16".to_string(),
+        Dtype::U32 => "uint32".to_string(),
+        Dtype::U64 => "uint64".to_string(),
+        Dtype::F8_E4M3 => "float8_e4m3fn".to_string(),
+        Dtype::F8_E5M2 => "float8_e5m2".to_string(),
+        Dtype::F8_E8M0 => "float8_e8m0fnu".to_string(),
+        Dtype::F4 => "float4_e2m1fn_x2".to_string(),
+        Dtype::C64 => "complex64".to_string(),
+        _ => format!("{dtype}"),
+    }
+}
+
+/// Fast file opener that uses aggregated tensor deserialization.
+///
+/// Instead of mmap-ing the file and instantiating tensors one-by-one, this
+/// reader bulk-copies the entire file body into a single device buffer and
+/// then creates zero-copy tensor views.
+///
+/// Args:
+///     filename (`str` or `os.PathLike`):
+///         Path to the `.safetensors` file.
+///
+///     device (`str`, defaults to `"cpu"`):
+///         Target device, e.g. `"cpu"`, `"cuda:0"`, `0`.
+///
+///     max_threads (`int`, defaults to `16`):
+///         Number of parallel I/O threads for `pread`-based reading.
+///
+///     bounce_buffer_size_kb (`int`, defaults to `16384`):
+///         Per-thread bounce buffer size in KiB (only used for GPU targets
+///         without GDS).
+///
+///     nogds (`bool`, defaults to `True`):
+///         If `True`, never use GPU Direct Storage even if available. If
+///         `False`, attempt GDS and fall back to bounce-buffer path on failure.
+///
+/// Example:
+///     ```python
+///     from safetensors import fast_safe_open
+///
+///     with fast_safe_open("model.safetensors", device="cuda:0") as f:
+///         for key in f.keys():
+///             tensor = f.get_tensor(key)
+///     ```
+#[pyclass]
+#[allow(non_camel_case_types)]
+struct fast_safe_open {
+    /// Inner state, `None` after `.close()` or `__exit__`.
+    inner: Option<FastOpen>,
+}
+
+impl fast_safe_open {
+    fn inner(&self) -> PyResult<&FastOpen> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))
+    }
+}
+
+#[pymethods]
+impl fast_safe_open {
+    #[new]
+    #[pyo3(signature = (filename, device=Some(Device::Cpu), max_threads=16, bounce_buffer_size_kb=16384, nogds=true))]
+    fn new(
+        filename: PathBuf,
+        device: Option<Device>,
+        max_threads: usize,
+        bounce_buffer_size_kb: usize,
+        nogds: bool,
+    ) -> PyResult<Self> {
+        let inner = Some(FastOpen::new(
+            filename,
+            device,
+            max_threads,
+            bounce_buffer_size_kb,
+            nogds,
+        )?);
+        Ok(Self { inner })
+    }
+
+    /// Return the special non-tensor metadata from the header.
+    ///
+    /// Returns:
+    ///     (`Optional[Dict[str, str]]`):
+    ///         The freeform metadata, or `None` if absent.
+    pub fn metadata(&self) -> PyResult<Option<HashMap<String, String>>> {
+        Ok(self.inner()?.metadata())
+    }
+
+    /// Returns the names of the tensors in the file.
+    ///
+    /// Returns:
+    ///     (`List[str]`):
+    ///         Tensor names.
+    pub fn keys(&self) -> PyResult<Vec<String>> {
+        self.inner()?.keys()
+    }
+
+    /// Returns the names of the tensors ordered by file offset.
+    ///
+    /// Returns:
+    ///     (`List[str]`):
+    ///         Tensor names in file order.
+    pub fn offset_keys(&self) -> PyResult<Vec<String>> {
+        self.inner()?.offset_keys()
+    }
+
+    /// Returns a tensor as a zero-copy view into the device buffer.
+    ///
+    /// Args:
+    ///     name (`str`):
+    ///         The name of the tensor.
+    ///
+    /// Returns:
+    ///     (`torch.Tensor`):
+    ///         A PyTorch tensor view (shares memory with the device buffer).
+    pub fn get_tensor(&self, name: &str) -> PyResult<PyObject> {
+        self.inner()?.get_tensor(name)
+    }
+
+    /// Returns the total body size in bytes.
+    ///
+    /// Returns:
+    ///     (`int`):
+    ///         Number of bytes in the tensor data body.
+    #[getter]
+    pub fn body_size(&self) -> PyResult<usize> {
+        Ok(self.inner()?.body_size())
+    }
+
+    /// Returns the header size in bytes.
+    ///
+    /// Returns:
+    ///     (`int`):
+    ///         Number of bytes occupied by the header (including the 8-byte
+    ///         length prefix).
+    #[getter]
+    pub fn header_size(&self) -> PyResult<usize> {
+        Ok(self.inner()?.header_size)
+    }
+
+    /// Check whether the header is aligned to the given byte boundary.
+    ///
+    /// Args:
+    ///     alignment (`int`):
+    ///         Alignment in bytes (e.g. 8, 512).
+    ///
+    /// Returns:
+    ///     (`bool`):
+    ///         `True` if aligned.
+    pub fn is_aligned(&self, alignment: usize) -> PyResult<bool> {
+        Ok(self.inner()?.is_aligned(alignment))
+    }
+
+    /// Explicitly release the device buffer.
+    ///
+    /// After calling this method every subsequent `get_tensor` call will raise.
+    pub fn close(&mut self) {
+        self.inner = None;
+    }
+
+    /// Context-manager entry.
+    pub fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// Context-manager exit — releases the device buffer.
+    pub fn __exit__(&mut self, _exc_type: PyObject, _exc_value: PyObject, _traceback: PyObject) {
+        self.inner = None;
+    }
+}
+
 /// A Python module implemented in Rust.
 #[pymodule(gil_used = false)]
 fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
@@ -1663,6 +2138,7 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
     m.add_class::<safe_open>()?;
     m.add_class::<_safe_open_handle>()?;
+    m.add_class::<fast_safe_open>()?;
     m.add("SafetensorError", m.py().get_type::<SafetensorError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

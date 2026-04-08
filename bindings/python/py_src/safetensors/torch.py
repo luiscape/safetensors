@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
+
 from safetensors import (
     deserialize,
     safe_open,
@@ -569,3 +570,99 @@ def _flatten_as_ptr(
             "data_len": arr.nbytes,
         }
     return flattened
+
+
+def load_file_fast(
+    filename: Union[str, os.PathLike],
+    device: Union[str, int] = "cpu",
+    nogds: bool = True,
+    max_threads: int = 16,
+) -> Dict[str, torch.Tensor]:
+    """Fast loading of a safetensors file using aggregated tensor deserialization.
+
+    Drop-in replacement for :func:`load_file` with significantly better
+    performance, especially for GPU loading.  Uses bulk I/O and zero-copy
+    tensor views.
+
+    Args:
+        filename (`str`, or `os.PathLike`):
+            Path to the ``.safetensors`` file.
+        device (`Union[str, int]`, *optional*, defaults to ``"cpu"``):
+            Target device (e.g. ``"cpu"``, ``"cuda:0"``, ``0``).
+        nogds (`bool`, *optional*, defaults to ``True``):
+            If ``True``, use pread + bounce buffer; if ``False``, attempt
+            GPU Direct Storage.
+        max_threads (`int`, *optional*, defaults to ``16``):
+            Number of parallel I/O threads.
+
+    Returns:
+        ``Dict[str, torch.Tensor]``
+
+    Example:
+
+    ```python
+    from safetensors.torch import load_file_fast
+
+    file_path = "./my_folder/bert.safetensors"
+    loaded = load_file_fast(file_path, device="cuda:0")
+    ```
+    """
+    from .fast import fast_load_file as _fast_load_file
+
+    return _fast_load_file(
+        str(filename), device=str(device), nogds=nogds, max_threads=max_threads
+    )
+
+
+def load_sharded(
+    filenames: Dict[int, List[str]],
+    device: Union[str, int] = "cuda:0",
+    process_group=None,
+    tensor_shard_dims: Optional[Dict[str, int]] = None,
+    nogds: bool = True,
+    max_threads: int = 16,
+) -> Dict[str, torch.Tensor]:
+    """Load and shard safetensors files across multiple GPUs.
+
+    Uses GPU-side collective operations for sharding, avoiding CPU
+    bottlenecks.
+
+    Args:
+        filenames (`Dict[int, List[str]]`):
+            Mapping from rank to list of file paths.
+        device (`Union[str, int]`, *optional*, defaults to ``"cuda:0"``):
+            Target device.
+        process_group:
+            ``torch.distributed`` ``ProcessGroup`` (required for
+            multi-GPU).
+        tensor_shard_dims (`Optional[Dict[str, int]]`):
+            Mapping from tensor name to the dimension to shard on.
+            Use ``-1`` for broadcast (all ranks get the full tensor).
+            If ``None``, all tensors are broadcast.
+        nogds (`bool`, *optional*, defaults to ``True``):
+            If ``True``, disable GPU Direct Storage.
+        max_threads (`int`, *optional*, defaults to ``16``):
+            I/O thread count.
+
+    Returns:
+        ``Dict[str, torch.Tensor]`` of (possibly sharded) tensors.
+
+    Example:
+
+    ```python
+    from safetensors.torch import load_sharded
+
+    filenames = {0: ["shard1.safetensors"], 1: ["shard2.safetensors"]}
+    loaded = load_sharded(filenames, device="cuda:0", process_group=pg)
+    ```
+    """
+    from .fast import fast_load_sharded as _fast_load_sharded
+
+    return _fast_load_sharded(
+        filenames,
+        device=str(device),
+        process_group=process_group,
+        tensor_shard_dims=tensor_shard_dims,
+        nogds=nogds,
+        max_threads=max_threads,
+    )

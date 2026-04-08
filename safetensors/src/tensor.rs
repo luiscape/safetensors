@@ -697,6 +697,27 @@ impl Metadata {
     pub fn metadata(&self) -> &Option<HashMap<String, String>> {
         &self.metadata
     }
+
+    /// Returns the byte offset range of the tensor data body within the file.
+    /// The first element is the header size (start of body), the second is the total file size.
+    pub fn body_byte_range(&self, header_size: usize) -> (usize, usize) {
+        (header_size, header_size + self.data_len())
+    }
+
+    /// Returns the byte offset range of a named tensor within the body buffer.
+    /// These offsets are relative to the start of the body (NOT the file).
+    pub fn tensor_body_offset(&self, name: &str) -> Option<(usize, usize)> {
+        self.info(name).map(|info| info.data_offsets)
+    }
+
+    /// Check if the header size causes tensor data to be misaligned for a given alignment.
+    /// Returns `true` if `header_size` is a multiple of `alignment` (or alignment is zero).
+    pub fn is_aligned(&self, header_size: usize, alignment: usize) -> bool {
+        if alignment == 0 {
+            return true;
+        }
+        header_size % alignment == 0
+    }
 }
 
 /// A view of a Tensor within the file.

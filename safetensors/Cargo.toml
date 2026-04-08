@@ -28,9 +28,8 @@ serde = { version = "1.0", default-features = false, features = [
 ] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.16", features = ["serde"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+rayon = { version = "1.10", optional = true }
 
 [dev-dependencies]
 criterion = "0.6"
@@ -42,6 +41,7 @@ default = ["std"]
 std = ["serde/default", "serde_json/default"]
 # Kept for backward compatibility - no-op since alloc is always available
 alloc = []
+fast_io = ["std", "rayon"]
 
 [[bench]]
 name = "benchmark"

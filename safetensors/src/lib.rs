@@ -3,10 +3,17 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 pub mod slice;
 pub mod tensor;
+/// Bulk I/O module for optimized parallel file reading (fastsafetensors integration).
+/// Only available when the `fast_io` feature is enabled.
+#[cfg(feature = "fast_io")]
+pub mod bulk_io;
 /// serialize_to_file only valid in std
 #[cfg(feature = "std")]
 pub use tensor::serialize_to_file;
 pub use tensor::{serialize, Dtype, SafeTensorError, SafeTensors, View};
+
+#[cfg(feature = "fast_io")]
+pub use bulk_io::{AlignmentFixup, BulkReadPlan, PreadBulkReader};
 
 #[cfg(not(feature = "std"))]
 #[macro_use]

@@ -3,8 +3,14 @@ import tempfile
 
 import pytest
 import torch
-
 from safetensors.torch import load_file, save_file
+
+try:
+    from safetensors.fast import FastSafeTensorsLoader, fast_load_file, fast_open
+
+    _has_fast = True
+except ImportError:
+    _has_fast = False
 
 
 def create_gpt2(n_layers: int):
@@ -151,6 +157,146 @@ def test_pt_sf_load_mps(benchmark):
 
     for k, v in weights.items():
         v = v.to(device="mps")
+        tv = result[k]
+        assert torch.allclose(v, tv)
+
+
+@pytest.mark.skipif(not _has_fast, reason="safetensors.fast not available")
+def test_pt_fast_load_cpu(benchmark):
+    """Fast path: bulk I/O with parallel pread on CPU."""
+    weights = create_gpt2(12)
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        save_file(weights, f.name)
+        result = benchmark(fast_load_file, f.name)
+    os.unlink(f.name)
+
+    for k, v in weights.items():
+        tv = result[k]
+        assert torch.allclose(v, tv)
+
+
+@pytest.mark.skipif(not _has_fast, reason="safetensors.fast not available")
+def test_pt_fast_load_cpu_small(benchmark):
+    """Fast path: bulk I/O on CPU with small LoRA model."""
+    weights = create_lora(500)
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        save_file(weights, f.name)
+        result = benchmark(fast_load_file, f.name)
+    os.unlink(f.name)
+
+    for k, v in weights.items():
+        tv = result[k]
+        assert torch.allclose(v, tv)
+
+
+@pytest.mark.skipif(not _has_fast, reason="safetensors.fast not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires cuda")
+def test_pt_fast_load_gpu(benchmark):
+    """Fast path: bulk I/O with bounce buffer on GPU."""
+    weights = create_gpt2(12)
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        save_file(weights, f.name)
+        result = benchmark(fast_load_file, f.name, device="cuda:0")
+    os.unlink(f.name)
+
+    for k, v in weights.items():
+        v = v.cuda()
+        tv = result[k]
+        assert torch.allclose(v, tv)
+
+
+@pytest.mark.skipif(not _has_fast, reason="safetensors.fast not available")
+def test_pt_fast_load_cpu_async(benchmark):
+    """Fast path with async submit/wait pattern (multi-file overlap)."""
+    weights = create_gpt2(12)
+
+    # Split weights into 3 shards by layer range
+    shard0 = {}
+    shard1 = {}
+    shard2 = {}
+    for k, v in weights.items():
+        if k.startswith("h."):
+            layer_num = int(k.split(".")[1])
+            if layer_num < 4:
+                shard0[k] = v
+            elif layer_num < 8:
+                shard1[k] = v
+            else:
+                shard2[k] = v
+        else:
+            # Non-layer tensors (wte, wpe, ln_f) go to shard0
+            shard0[k] = v
+
+    filenames = []
+    for shard in [shard0, shard1, shard2]:
+        f = tempfile.NamedTemporaryFile(delete=False)
+        save_file(shard, f.name)
+        filenames.append(f.name)
+        f.close()
+
+    def load_async():
+        loader = FastSafeTensorsLoader(device="cpu")
+        loader.add_filenames({0: filenames})
+        buf = loader.copy_files_to_device()
+        result = {}
+        for key in buf.keys():
+            result[key] = buf.get_tensor(key).clone()
+        buf.close()
+        loader.close()
+        return result
+
+    result = benchmark(load_async)
+
+    for fname in filenames:
+        os.unlink(fname)
+
+    for k, v in weights.items():
+        tv = result[k]
+        assert torch.allclose(v, tv)
+
+
+@pytest.mark.skipif(not _has_fast, reason="safetensors.fast not available")
+def test_pt_fast_load_cpu_large(benchmark):
+    """Fast path: larger GPT-2 model (48 layers, ~120 MB)."""
+    weights = create_gpt2(48)
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        save_file(weights, f.name)
+        result = benchmark(fast_load_file, f.name)
+    os.unlink(f.name)
+
+    for k, v in weights.items():
+        tv = result[k]
+        assert torch.allclose(v, tv)
+
+
+def test_pt_sf_load_cpu_large(benchmark):
+    """Baseline: safetensors load_file with larger GPT-2 model (48 layers)."""
+    weights = create_gpt2(48)
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        save_file(weights, f.name)
+        result = benchmark(load_file, f.name)
+    os.unlink(f.name)
+
+    for k, v in weights.items():
+        tv = result[k]
+        assert torch.allclose(v, tv)
+
+
+@pytest.mark.skipif(not _has_fast, reason="safetensors.fast not available")
+def test_pt_fast_open_cpu(benchmark):
+    """Fast path: using fast_open context manager."""
+    weights = create_gpt2(12)
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        save_file(weights, f.name)
+
+        def load_via_fast_open():
+            with fast_open(f.name, device="cpu") as fo:
+                return {k: fo.get_tensor(k).clone() for k in fo.keys()}
+
+        result = benchmark(load_via_fast_open)
+    os.unlink(f.name)
+
+    for k, v in weights.items():
         tv = result[k]
         assert torch.allclose(v, tv)
 

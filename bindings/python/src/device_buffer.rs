@@ -873,13 +873,13 @@ pub unsafe fn gds_read_file_body(
 ) -> Result<(), String> {
     use std::io;
 
-    // -- Open the file with O_DIRECT for GDS compatibility -------------------
+    // -- Open the file without O_DIRECT (GDS 1.7+ / CUDA 12.2+) -------------------
     let c_path = std::ffi::CString::new(path).map_err(|e| format!("Invalid path '{path}': {e}"))?;
     // Safety: c_path is a valid NUL-terminated string.
-    let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT);
+    let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY);
     if fd < 0 {
         return Err(format!(
-            "Failed to open '{path}' with O_DIRECT: {}",
+            "Failed to open '{path}': {}",
             io::Error::last_os_error()
         ));
     }
@@ -1207,13 +1207,13 @@ pub unsafe fn gds_read_file_body_pooled(
 
     let max_block_size: u64 = 1 << 30; // 1 GiB
 
-    // -- Open the file with O_DIRECT for GDS compatibility -------------------
+    // -- Open the file without O_DIRECT (GDS 1.7+ / CUDA 12.2+) -------------------
     let c_path = std::ffi::CString::new(path).map_err(|e| format!("Invalid path '{path}': {e}"))?;
     // Safety: c_path is a valid NUL-terminated string.
-    let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT);
+    let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY);
     if fd < 0 {
         return Err(format!(
-            "Failed to open '{path}' with O_DIRECT: {}",
+            "Failed to open '{path}': {}",
             io::Error::last_os_error()
         ));
     }

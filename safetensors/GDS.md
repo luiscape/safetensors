@@ -1,9 +1,11 @@
-# GPU Direct Storage (GDS) Integration for Safetensors
+# GPU Direct Storage (GDS) & nvcomp Compression for Safetensors
 
 This document describes the fast GPU loading path added to safetensors, based on
 the techniques from the [fastsafetensors paper](https://arxiv.org/abs/2505.23072)
-(IEEE CLOUD 2025). The implementation lives in the Rust core crate, the PyO3
-Python bindings, and a pure-Python fallback layer.
+(IEEE CLOUD 2025), extended with **nvcomp Zstandard compression** for further
+throughput gains when storage bandwidth is the bottleneck. The implementation
+lives in the Rust core crate, the PyO3 Python bindings, and a pure-Python
+fallback layer.
 
 ---
 
@@ -332,6 +334,220 @@ outperforms the mmap path on cold storage.
 
 ---
 
+---
+
+## nvcomp Zstandard Compression
+
+### Motivation
+
+The GDS fast path already achieves 93% of NVMe bandwidth. The only way to
+go faster is to **read fewer bytes**. By compressing the tensor data body
+with Zstandard and decompressing on the GPU via NVIDIA's nvcomp library, we
+can reduce NVMe transfer time proportionally to the compression ratio while
+adding only modest GPU decompression overhead.
+
+### Compression Format
+
+Compressed safetensors files use the standard header format with two
+additional entries in `__metadata__`:
+
+```json
+{
+  "__metadata__": {
+    "compression": "zstd",
+    "compression_info": "{\"method\":\"Zstd\",\"level\":3,\"decompressed_size\":1353000000,\"compressed_size\":850000000,\"chunk_size\":16777216,\"chunks\":[{\"compressed_offset\":0,\"compressed_size\":10200000,\"decompressed_offset\":0,\"decompressed_size\":16777216}, ...]}"
+  },
+  "weight0": {
+    "dtype": "F16",
+    "shape": [4096, 4096],
+    "data_offsets": [0, 33554432]
+  }
+}
+```
+
+Key design decisions:
+
+- **Chunked whole-body compression**: the body is split into fixed-size
+  decompressed chunks (default 16 MiB), each independently compressed.
+  This enables parallel GPU decompression via nvcomp's batch API.
+- **`data_offsets` are decompressed offsets**: tensor views work unchanged
+  after decompression. A separate chunk table maps compressed ↔ decompressed
+  positions.
+- **Backward-compatible**: old readers see the `"compression"` key and can
+  reject the file cleanly. Uncompressed files have no compression metadata.
+
+### Architecture
+
+```text
+┌─────────────┐   cuFileRead    ┌──────────┐  nvcomp batch  ┌──────────┐
+│  NVMe SSD   │ ──────────────► │ GPU VRAM │ ─────────────► │ GPU VRAM │
+│ (compressed │  (compressed    │ (staging │  zstd decomp   │ (decomp  │
+│   .safetensors)  DMA)         │  buffer) │                │  buffer) │
+└─────────────┘                 └──────────┘                └──────────┘
+                                                                 │
+                                                    ┌────────────┼────────────┐
+                                                    ▼            ▼            ▼
+                                               tensor_a     tensor_b     tensor_c
+                                              (view)        (view)        (view)
+```
+
+#### Rust Core Crate (`safetensors/src/`)
+
+| Type | File | Purpose |
+|---|---|---|
+| `CompressionMethod` | `tensor.rs` | Enum: `None`, `Zstd` |
+| `CompressedChunk` | `tensor.rs` | Per-chunk offset/size metadata |
+| `CompressionInfo` | `tensor.rs` | Full compression descriptor; parse from / write to `__metadata__` |
+| `CompressedReadPlan` | `bulk_io.rs` | Maps chunks to file offsets and buffer positions |
+| `CompressedChunkRead` | `bulk_io.rs` | Single chunk read descriptor |
+
+New error variants in `SafeTensorError`:
+- `UnsupportedCompression(String)` — file uses unknown compression
+- `DecompressionError(String)` — decompression failed
+
+#### Python Bindings (`bindings/python/src/`)
+
+| Module | Purpose |
+|---|---|
+| `nvcomp_runtime.rs` | Runtime-loaded `libnvcomp.so` FFI (batched zstd decompress) |
+| `device_buffer.rs` | `decompress_on_gpu()` — orchestrates nvcomp batch API; `decompress_cpu_zstd()` — CPU fallback |
+| `bulk_reader.rs` | `read_compressed_file_to_device()` — pread + decompress; `read_compressed_file_gds_decompress()` — GDS + nvcomp |
+| `lib.rs` | `FastOpen::new` detects compression and routes to the appropriate pipeline |
+
+#### Python Layer (`bindings/python/py_src/safetensors/`)
+
+| Function | File | Purpose |
+|---|---|---|
+| `_parse_compression_info()` | `fast.py` | Extract compression metadata from header |
+| `save_compressed()` | `fast.py` | Serialize + chunked zstd compress + write |
+| `save_compressed()` | `torch.py` | Convenience wrapper for `fast.save_compressed` |
+
+### Loading Pipeline (compressed files)
+
+When `FastOpen::new` detects `"compression": "zstd"` in the header:
+
+1. Parse `CompressionInfo` from `__metadata__["compression_info"]`.
+2. Allocate decompressed-size device buffer on GPU.
+3. **Try GDS + nvcomp** (highest throughput):
+   a. Acquire compressed staging buffer from GDS pool.
+   b. `cuFileRead` compressed body → GPU staging buffer (NVMe DMA).
+   c. `nvcompBatchedZstdDecompressAsync` → decompressed buffer.
+   d. Free staging buffer.
+4. **Fallback: pread + nvcomp**:
+   a. Parallel `pread` compressed body → host memory.
+   b. `cudaMemcpy` → GPU compressed staging buffer.
+   c. nvcomp batch decompress → decompressed buffer.
+   d. Free staging buffer.
+5. **CPU fallback** (no GPU or no nvcomp):
+   a. `pread` compressed body → host memory.
+   b. CPU `zstd::decode_all` → host decompressed buffer.
+   c. Copy to device buffer.
+6. Create zero-copy tensor views (unchanged from uncompressed path).
+
+The selection is automatic — `load_file("model.safetensors", device="cuda:0")`
+handles both compressed and uncompressed files transparently.
+
+### Saving Compressed Files
+
+```python
+from safetensors.torch import save_compressed
+
+save_compressed(
+    {"weight": model.weight},
+    "model.safetensors",
+    compression="zstd",
+    level=3,            # zstd level 1-19
+    chunk_size=16777216 # 16 MiB chunks
+)
+```
+
+The write path uses CPU-side zstd compression (via the `zstandard` Python
+package). It serializes tensors to an uncompressed buffer, compresses the
+body in independent chunks, injects compression metadata into the header,
+and writes the compressed file.
+
+### Projected Performance
+
+#### Back-of-envelope (1,353 MB model, AWS g5.12xlarge, cold NVMe)
+
+| Path | NVMe Read | GPU Decomp | Overhead | Total | vs Uncompressed |
+|---|---|---|---|---|---|
+| Uncompressed GDS | 398 ms (1,353 MB) | — | 30 ms | **428 ms** | baseline |
+| Compressed GDS (2× ratio, FP16) | 199 ms (677 MB) | 68 ms | 35 ms | **~302 ms** | **1.42×** |
+| Compressed GDS (1.5× ratio, BF16) | 265 ms (902 MB) | 68 ms | 35 ms | **~368 ms** | **1.16×** |
+| Compressed GDS (1.1× ratio, INT8) | 362 ms (1,230 MB) | 68 ms | 35 ms | **~465 ms** | 0.92× (slower) |
+
+Key takeaways:
+- **FP32/FP16 weights**: strong 1.3–1.7× speedup (good compression ratios)
+- **BF16 weights**: moderate 1.1–1.2× speedup
+- **INT8/INT4 weights**: marginal or negative — high entropy compresses poorly
+- The auto-detection means there is **zero overhead** for uncompressed files
+
+#### CPU zstd benchmarks (this implementation, ~497 MB synthetic GPT-2 body)
+
+| Operation | Level | Time | Throughput |
+|---|---|---|---|
+| Compress | 1 | 94 ms | 5,291 MB/s |
+| Compress | 3 | 141 ms | 3,527 MB/s |
+| Compress | 5 | 242 ms | 2,055 MB/s |
+| Decompress | — | 288 ms | 1,727 MB/s |
+| CompressedReadPlan::new | — | 178 ns | — |
+
+Note: synthetic zero-filled data gives unrealistic compression ratios (~31000×).
+Real model weights typically compress 1.3–2.0× for floating-point dtypes.
+
+### Building
+
+#### With nvcomp support
+
+Requires `libnvcomp.so` (NVIDIA nvcomp ≥ 3.0) and `libcudart.so`:
+
+```bash
+cd bindings/python
+maturin develop --release --features gds,nvcomp
+```
+
+#### With CPU-only compression
+
+No GPU libraries needed — uses the `zstd` Rust crate:
+
+```bash
+# Rust core crate
+cargo build --features fast_io,compression
+
+# Python bindings (CPU zstd fallback only)
+cd bindings/python
+pip install zstandard
+maturin develop --release
+```
+
+### Feature Flags
+
+| Crate | Feature | Description |
+|---|---|---|
+| `safetensors` (core) | `compression` | Enables `CompressionInfo`, `CompressedReadPlan`, zstd CPU codec |
+| `safetensors-python` | `nvcomp` | Enables GPU decompression via `libnvcomp.so` + CPU zstd fallback; implies `libloading`, `zstd`, `safetensors/compression` |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `SAFETENSORS_FAST_GPU` | `1` | Set to `0` to disable the fast GPU path in `load_file` |
+
+### System Requirements for nvcomp
+
+| Requirement | Details |
+|---|---|
+| GPU | NVIDIA with compute capability ≥ 7.0 |
+| nvcomp | `libnvcomp.so` ≥ 3.0 (part of nvcomp SDK or RAPIDS) |
+| CUDA | `libcudart.so` (CUDA Toolkit ≥ 11.4) |
+| Python (write path) | `pip install zstandard` |
+
+When nvcomp is unavailable, compressed files are still loadable via the CPU
+zstd fallback path (slower, but functional).
+
+---
+
 ## References
 
 - Yoshimura, T. et al. "Speeding up Model Loading with fastsafetensors."
@@ -339,3 +555,6 @@ outperforms the mmap path on cold storage.
 - [fastsafetensors source](https://github.com/foundation-model-stack/fastsafetensors)
 - [NVIDIA GPUDirect Storage Design Guide](https://docs.nvidia.com/gpudirect-storage/design-guide/index.html)
 - [cuFile API Reference](https://docs.nvidia.com/gpudirect-storage/api-reference-guide/index.html)
+- [NVIDIA nvcomp Documentation](https://developer.nvidia.com/nvcomp)
+- [nvcomp GitHub](https://github.com/NVIDIA/nvcomp)
+- [Zstandard (zstd)](https://facebook.github.io/zstd/)

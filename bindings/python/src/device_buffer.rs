@@ -1277,6 +1277,262 @@ pub unsafe fn gds_read_file_body_pooled(
     result
 }
 
+// ===========================================================================
+// nvcomp decompression support (GPU-side ANS via C shim)
+// ===========================================================================
+
+// ---- Pre-allocated auxiliary buffer pool for nvcomp decompress -------------
+//
+// The nvcomp batched ANS decompress call needs a device-side auxiliary buffer
+// holding the temp workspace and the four arrays of per-chunk pointers/sizes.
+// Allocating and freeing this via `cudaMalloc` / `cudaFree` on every load
+// costs ~30 ms.  This pool caches the allocation across loads so that
+// repeated loads of the same (or similarly-sized) model pay zero alloc cost.
+
+#[cfg(feature = "nvcomp")]
+struct NvcompAuxPool {
+    /// Raw device pointer returned by `cudaMalloc`.
+    ptr: *mut std::ffi::c_void,
+    /// Current allocated size in bytes.
+    size: usize,
+    /// CUDA device ordinal this buffer lives on.
+    device_id: i32,
+}
+
+// Safety: the raw pointer is a CUDA device pointer whose lifetime is managed
+// by this singleton.  Access is serialised by the `Mutex`.
+#[cfg(feature = "nvcomp")]
+unsafe impl Send for NvcompAuxPool {}
+
+#[cfg(feature = "nvcomp")]
+static NVCOMP_AUX_POOL: std::sync::Mutex<Option<NvcompAuxPool>> = std::sync::Mutex::new(None);
+
+/// Acquire a device buffer of at least `min_size` bytes on `device_id`.
+///
+/// If the cached buffer is large enough and on the right device it is reused
+/// (zero-cost).  Otherwise a new buffer is allocated, rounded up to the next
+/// 16 MiB boundary for headroom, and the old one is freed.
+#[cfg(feature = "nvcomp")]
+unsafe fn nvcomp_aux_acquire(
+    cuda: &crate::cuda_runtime::CudaRuntime,
+    min_size: usize,
+    device_id: i32,
+) -> Result<*mut std::ffi::c_void, String> {
+    let mut guard = NVCOMP_AUX_POOL
+        .lock()
+        .map_err(|e| format!("nvcomp aux pool lock poisoned: {e}"))?;
+
+    // Fast path: reuse existing buffer.
+    if let Some(ref pool) = *guard {
+        if pool.size >= min_size && pool.device_id == device_id {
+            return Ok(pool.ptr);
+        }
+        // Wrong size or device — free the old buffer.
+        cuda.set_device(pool.device_id).ok();
+        cuda.free(pool.ptr);
+    }
+
+    // Round up to 16 MiB boundary.
+    const ALIGN: usize = 16 * 1024 * 1024;
+    let alloc_size = ((min_size + ALIGN - 1) / ALIGN) * ALIGN;
+
+    cuda.set_device(device_id)?;
+    let ptr = cuda.malloc(alloc_size)?;
+
+    *guard = Some(NvcompAuxPool {
+        ptr,
+        size: alloc_size,
+        device_id,
+    });
+
+    Ok(ptr)
+}
+
+/// Decompresses ANS-compressed data on the GPU using the nvcomp C batched API
+/// via the `libnvcomp_shim.so` ABI shim.
+///
+/// Zero Python overhead for the GPU operations: temp query, device array
+/// upload, batched decompress kernel, and synchronization all go through
+/// direct C calls from Rust.
+///
+/// The auxiliary GPU buffer (temp workspace + pointer/size arrays) is
+/// **pre-allocated** via the process-wide `NvcompAuxPool` singleton, so
+/// repeated loads avoid `cudaMalloc` / `cudaFree` entirely.
+///
+/// The compressed body must have **8-byte aligned chunk boundaries** (chunks
+/// are padded during save).  The `chunks` tuples contain the *actual*
+/// (un-padded) compressed sizes; the offsets are padded.
+#[cfg(feature = "nvcomp")]
+pub fn decompress_on_gpu(
+    _py: Python<'_>,
+    compressed_buf: &DeviceBuffer,
+    decompressed_buf: &DeviceBuffer,
+    chunks: &[(usize, usize, usize, usize)],
+    _algorithm: &str,
+) -> PyResult<()> {
+    use crate::cuda_runtime::CudaRuntime;
+    use crate::nvcomp_runtime::NvcompRuntime;
+    use std::ffi::c_void;
+
+    let nvcomp = NvcompRuntime::get().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "nvcomp shim not available (libnvcomp_shim.so not found).",
+        )
+    })?;
+    let cuda = CudaRuntime::get().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "CUDA runtime not available (libcudart.so not found).",
+        )
+    })?;
+
+    let batch_size = chunks.len();
+    if batch_size == 0 {
+        return Ok(());
+    }
+
+    // The compressed body is contiguous in `compressed_buf` with 8-byte
+    // aligned chunk boundaries (padded during save).  Each chunk's
+    // `compressed_offset` is already aligned, so we can point directly
+    // into the buffer without per-chunk copies.
+    let comp_base = compressed_buf.data_ptr as usize;
+    let decomp_base = decompressed_buf.data_ptr as usize;
+
+    let mut comp_ptrs: Vec<*const c_void> = Vec::with_capacity(batch_size);
+    let mut comp_sizes: Vec<usize> = Vec::with_capacity(batch_size);
+    let mut decomp_ptrs: Vec<*mut c_void> = Vec::with_capacity(batch_size);
+    let mut decomp_buf_sizes: Vec<usize> = Vec::with_capacity(batch_size);
+    let mut max_decomp_chunk: usize = 0;
+    let mut total_decomp: usize = 0;
+
+    for &(co, cs, do_, ds) in chunks {
+        comp_ptrs.push((comp_base + co) as *const c_void);
+        comp_sizes.push(cs);
+        decomp_ptrs.push((decomp_base + do_) as *mut c_void);
+        decomp_buf_sizes.push(ds);
+        max_decomp_chunk = max_decomp_chunk.max(ds);
+        total_decomp += ds;
+    }
+
+    unsafe {
+        let device_id: i32 = compressed_buf
+            .device
+            .strip_prefix("cuda:")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        cuda.set_device(device_id)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        // Get temp workspace size
+        let temp_bytes = nvcomp
+            .ans_decompress_get_temp_size(batch_size, max_decomp_chunk, total_decomp)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        // Compute layout: [temp | comp_ptrs | comp_sizes | decomp_ptrs | decomp_buf_sizes]
+        let ptrs_bytes = batch_size * std::mem::size_of::<*const c_void>();
+        let sizes_bytes = batch_size * std::mem::size_of::<usize>();
+        let total_aux = temp_bytes + 2 * ptrs_bytes + 2 * sizes_bytes;
+
+        // Acquire from the pre-allocated pool (zero-cost on repeated loads).
+        let aux = nvcomp_aux_acquire(cuda, total_aux, device_id).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "nvcomp aux pool acquire({total_aux}) failed: {e}"
+            ))
+        })?;
+
+        let temp_ptr = aux;
+        let d_comp_ptrs = (aux as *mut u8).add(temp_bytes) as *mut c_void;
+        let d_comp_sizes = (aux as *mut u8).add(temp_bytes + ptrs_bytes) as *mut c_void;
+        let d_decomp_ptrs =
+            (aux as *mut u8).add(temp_bytes + ptrs_bytes + sizes_bytes) as *mut c_void;
+        let d_decomp_bsz =
+            (aux as *mut u8).add(temp_bytes + 2 * ptrs_bytes + sizes_bytes) as *mut c_void;
+
+        // Upload arrays to device
+        cuda.memcpy_h2d(d_comp_ptrs, comp_ptrs.as_ptr() as *const c_void, ptrs_bytes)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        cuda.memcpy_h2d(
+            d_comp_sizes,
+            comp_sizes.as_ptr() as *const c_void,
+            sizes_bytes,
+        )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        cuda.memcpy_h2d(
+            d_decomp_ptrs,
+            decomp_ptrs.as_ptr() as *const c_void,
+            ptrs_bytes,
+        )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        cuda.memcpy_h2d(
+            d_decomp_bsz,
+            decomp_buf_sizes.as_ptr() as *const c_void,
+            sizes_bytes,
+        )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        cuda.synchronize()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        // Single batched ANS decompress call — zero Python overhead
+        nvcomp
+            .ans_decompress_async(
+                d_comp_ptrs as *const *const c_void,
+                d_comp_sizes as *const usize,
+                d_decomp_bsz as *const usize,
+                std::ptr::null_mut(),
+                batch_size,
+                temp_ptr,
+                temp_bytes,
+                d_decomp_ptrs as *const *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANS batched decompress failed: {e}"
+                ))
+            })?;
+
+        cuda.synchronize()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        // Do NOT free `aux` — it stays in the pool for reuse.
+    }
+
+    Ok(())
+}
+
+/// CPU fallback: decompress zstd-compressed body data using the `zstd` crate.
+///
+/// This is used when the target device is CPU or when nvcomp is not available.
+///
+/// # Arguments
+///
+/// * `compressed_data` — The compressed body bytes.
+/// * `decompressed_size` — Expected total decompressed size.
+///
+/// # Returns
+///
+/// The decompressed bytes.
+#[cfg(feature = "nvcomp")]
+pub fn decompress_cpu_zstd(
+    compressed_data: &[u8],
+    decompressed_size: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::new(compressed_data)
+        .map_err(|e| format!("Failed to create zstd decoder: {e}"))?;
+    let mut output = Vec::with_capacity(decompressed_size);
+    decoder
+        .read_to_end(&mut output)
+        .map_err(|e| format!("Zstd decompression failed: {e}"))?;
+    if output.len() != decompressed_size {
+        return Err(format!(
+            "Decompressed size mismatch: expected {decompressed_size}, got {}",
+            output.len()
+        ));
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

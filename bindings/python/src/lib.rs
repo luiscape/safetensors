@@ -12,7 +12,7 @@ use pyo3::{intern, PyErr};
 #[allow(unused_imports)]
 use safetensors::bulk_io::{compute_alignment_fixups, BulkReadPlan};
 use safetensors::slice::TensorIndexer;
-use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
+use safetensors::tensor::{CompressionInfo, Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
 use safetensors::View;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -26,6 +26,8 @@ mod bulk_reader;
 #[cfg(feature = "gds")]
 mod cuda_runtime;
 mod device_buffer;
+#[cfg(feature = "nvcomp")]
+mod nvcomp_runtime;
 
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -1696,12 +1698,70 @@ impl FastOpen {
             ))
         })?;
         let buffer = unsafe { MmapOptions::new().map_copy_read_only(&file)? };
-        let _file_size = buffer.len();
-        let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
+        let file_size = buffer.len();
+
+        // First, parse the header without body-size validation so that
+        // compressed files (whose on-disk body is smaller than data_offsets
+        // imply) are not rejected.
+        let (n, metadata) = SafeTensors::read_metadata_header_only(&buffer).map_err(|e| {
             SafetensorError::new_err(format!("Error while deserializing header: {e}"))
         })?;
         let header_size = n + 8;
-        let body_size = metadata.data_len();
+
+        // Check for compression metadata in the header.
+        let raw_meta = metadata.metadata();
+        eprintln!(
+            "[safetensors::FastOpen] metadata keys: {:?}, has compression: {}, has compression_info: {}",
+            raw_meta.as_ref().map(|m| m.keys().collect::<Vec<_>>()),
+            raw_meta.as_ref().and_then(|m| m.get("compression")).is_some(),
+            raw_meta.as_ref().and_then(|m| m.get("compression_info")).is_some(),
+        );
+        if let Some(ref m) = *raw_meta {
+            if let Some(ci_str) = m.get("compression_info") {
+                eprintln!(
+                    "[safetensors::FastOpen] compression_info[..200]: {}",
+                    &ci_str[..ci_str.len().min(200)]
+                );
+                let parse_result: Result<CompressionInfo, _> = serde_json::from_str(ci_str);
+                eprintln!(
+                    "[safetensors::FastOpen] serde parse result: {:?}",
+                    parse_result.as_ref().map(|ci| &ci.method)
+                );
+                if let Err(ref e) = parse_result {
+                    eprintln!("[safetensors::FastOpen] serde parse ERROR: {e}");
+                }
+            }
+        }
+        let compression_info = CompressionInfo::from_metadata(raw_meta);
+        let _is_compressed = compression_info.is_some();
+        eprintln!(
+            "[safetensors::FastOpen] compression_info is_some: {}",
+            compression_info.is_some()
+        );
+
+        // For uncompressed files, the on-disk body must match data_offsets.
+        // For compressed files, body_size is the *decompressed* size (from
+        // data_offsets) while the actual file body is the compressed size.
+        let body_size = if let Some(ref ci) = compression_info {
+            // Sanity-check: the compressed body should match the file.
+            let expected_file_size = header_size + ci.compressed_size;
+            if file_size != expected_file_size {
+                return Err(SafetensorError::new_err(format!(
+                    "Compressed file size mismatch: expected {} (header {header_size} + compressed {}), got {file_size}",
+                    expected_file_size, ci.compressed_size
+                )));
+            }
+            metadata.data_len() // decompressed size for buffer allocation
+        } else {
+            // Uncompressed: validate body covers the file exactly.
+            let expected = metadata.data_len() + header_size;
+            if file_size != expected {
+                return Err(SafetensorError::new_err(format!(
+                    "Error while deserializing header: Metadata incomplete buffer"
+                )));
+            }
+            metadata.data_len()
+        };
 
         // Drop the mmap — we no longer need it.
         drop(buffer);
@@ -1823,11 +1883,105 @@ impl FastOpen {
             }
         }
 
-        // Allocate the device buffer for the non-GDS fallback path.
+        // Determine buffer size: for compressed files, we need the decompressed size.
+        let buffer_size = if let Some(ref ci) = compression_info {
+            ci.decompressed_size
+        } else {
+            body_size
+        };
+
+        // Allocate the device buffer.
         let device_buf = Python::with_gil(|py| {
-            device_buffer::allocate_device_buffer(py, body_size, &device_str)
+            device_buffer::allocate_device_buffer(py, buffer_size, &device_str)
         })?;
 
+        // ── Compressed file path ────────────────────────────────────────
+        #[cfg(feature = "nvcomp")]
+        if let Some(ref ci) = compression_info {
+            let chunk_tuples: Vec<(usize, usize, usize, usize)> = ci
+                .chunks
+                .iter()
+                .map(|c| {
+                    (
+                        c.compressed_offset,
+                        c.compressed_size,
+                        c.decompressed_offset,
+                        c.decompressed_size,
+                    )
+                })
+                .collect();
+
+            let algorithm = match ci.method {
+                safetensors::CompressionMethod::Zstd => "zstd",
+                safetensors::CompressionMethod::Ans => "ans",
+                safetensors::CompressionMethod::None => "zstd",
+            };
+
+            // Try GDS + nvcomp for compressed GPU loading.
+            #[cfg(feature = "gds")]
+            let gds_decomp_ok = if _is_gpu && !nogds {
+                match Python::with_gil(|py| {
+                    reader.read_compressed_file_gds_decompress(
+                        py,
+                        path_str,
+                        header_size,
+                        ci.compressed_size,
+                        &device_buf,
+                        &chunk_tuples,
+                        &device_str,
+                        algorithm,
+                    )
+                }) {
+                    Ok(ok) => ok,
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+
+            #[cfg(not(feature = "gds"))]
+            let gds_decomp_ok = false;
+
+            if !gds_decomp_ok {
+                Python::with_gil(|py| {
+                    reader.read_compressed_file_to_device(
+                        py,
+                        path_str,
+                        header_size,
+                        ci.compressed_size,
+                        ci.decompressed_size,
+                        &device_buf,
+                        &chunk_tuples,
+                        algorithm,
+                    )
+                })?;
+            }
+
+            // Alignment fixup for decompressed layout.
+            if !metadata.is_aligned(header_size, 8) {
+                let fixups_raw = compute_alignment_fixups(&metadata, header_size, 8);
+                if !fixups_raw.is_empty() {
+                    Python::with_gil(|py| -> PyResult<()> {
+                        let fixups: Vec<(usize, usize, usize)> = fixups_raw
+                            .iter()
+                            .map(|f| (f.current_offset, f.aligned_offset, f.length))
+                            .collect();
+                        device_buffer::fix_alignment(py, &device_buf, &fixups)?;
+                        Ok(())
+                    })?;
+                }
+            }
+
+            return Ok(Self {
+                metadata,
+                header_size,
+                device_buf,
+                device,
+                framework,
+            });
+        }
+
+        // ── Uncompressed file path (existing logic) ─────────────────────
         {
             // Try direct cudaMemcpy path for GPU devices (no GIL needed).
             #[cfg(feature = "gds")]

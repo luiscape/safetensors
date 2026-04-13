@@ -30,6 +30,7 @@ serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.16", features = ["serde"] }
 libc = "0.2"
 rayon = { version = "1.10", optional = true }
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 criterion = "0.6"
@@ -42,6 +43,7 @@ std = ["serde/default", "serde_json/default"]
 # Kept for backward compatibility - no-op since alloc is always available
 alloc = []
 fast_io = ["std", "rayon"]
+compression = ["std", "zstd"]
 
 [[bench]]
 name = "benchmark"

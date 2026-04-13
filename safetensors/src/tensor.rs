@@ -49,6 +49,10 @@ pub enum SafeTensorError {
     /// For smaller than 1 byte dtypes, some slices will happen outside of the byte boundary, some special care has to be taken
     /// and standard functions will fail
     MisalignedSlice,
+    /// The file uses a compression method not supported by this build.
+    UnsupportedCompression(String),
+    /// Decompression failed.
+    DecompressionError(String),
 }
 
 #[cfg(feature = "std")]
@@ -90,7 +94,13 @@ impl Display for SafeTensorError {
             }
             MetadataIncompleteBuffer => write!(f, "incomplete metadata, file not fully covered"),
             ValidationOverflow => write!(f, "overflow computing buffer size from shape and/or element type"),
-            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid.")
+            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid."),
+            UnsupportedCompression(ref method) => {
+                write!(f, "Unsupported compression method: {method}")
+            }
+            DecompressionError(ref msg) => {
+                write!(f, "Decompression failed: {msg}")
+            }
         }
     }
 }
@@ -420,6 +430,55 @@ impl<'data> SafeTensors<'data> {
         if buffer_end + N_LEN + n != buffer_len {
             return Err(SafeTensorError::MetadataIncompleteBuffer);
         }
+
+        Ok((n, metadata))
+    }
+
+    /// Parse the header from a byte-buffer **without** validating that the
+    /// tensor `data_offsets` fully cover the file body.
+    ///
+    /// This is required for **compressed** safetensors files where the on-disk
+    /// body is smaller than the decompressed body described by `data_offsets`.
+    /// The standard [`read_metadata`](Self::read_metadata) method rejects such
+    /// files with [`SafeTensorError::MetadataIncompleteBuffer`].
+    ///
+    /// The buffer must contain *at least* the 8-byte length prefix and the
+    /// full JSON header.  It may be shorter than the sum of tensor offsets.
+    ///
+    /// # Returns
+    ///
+    /// `(header_json_length, metadata)` — same semantics as `read_metadata`.
+    pub fn read_metadata_header_only(
+        buffer: &'data [u8],
+    ) -> Result<(usize, Metadata), SafeTensorError> {
+        let Some(header_size_bytes) = buffer.get(..N_LEN) else {
+            return Err(SafeTensorError::HeaderTooSmall);
+        };
+        let arr: [u8; N_LEN] = header_size_bytes
+            .try_into()
+            .expect("this can't fail due to how `header_size_bytes` is defined above");
+        let n: usize = u64::from_le_bytes(arr)
+            .try_into()
+            .map_err(|_| SafeTensorError::HeaderTooLarge)?;
+
+        if n > MAX_HEADER_SIZE {
+            return Err(SafeTensorError::HeaderTooLarge);
+        }
+
+        let stop = n
+            .checked_add(N_LEN)
+            .ok_or(SafeTensorError::InvalidHeaderLength)?;
+
+        let Some(header_bytes) = buffer.get(N_LEN..stop) else {
+            return Err(SafeTensorError::InvalidHeaderLength);
+        };
+        let string = core::str::from_utf8(header_bytes).map_err(SafeTensorError::InvalidHeader)?;
+        let metadata: HashMetadata =
+            serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
+        let metadata: Metadata = metadata.try_into()?;
+        // Validate tensor shapes/dtypes/offsets consistency but do NOT check
+        // that offsets cover the file body (the body may be compressed).
+        let _buffer_end = metadata.validate()?;
 
         Ok((n, metadata))
     }
@@ -875,6 +934,112 @@ pub enum Dtype {
     I64,
     /// Unsigned integer (64-bit)
     U64,
+}
+
+/// Compression method applied to the tensor data body.
+///
+/// When the safetensors header contains `"compression"` in its `__metadata__`,
+/// the body is compressed.  The chunk index describes how the compressed body
+/// is split into independently-decompressible chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionMethod {
+    /// No compression (default for standard safetensors files).
+    None,
+    /// Zstandard compression (nvcomp-compatible on GPU, zstd on CPU).
+    Zstd,
+    /// Asymmetric Numeral Systems (nvcomp gANS). ~10x faster than ZSTD on GPU.
+    Ans,
+}
+
+impl Default for CompressionMethod {
+    fn default() -> Self {
+        CompressionMethod::None
+    }
+}
+
+impl core::fmt::Display for CompressionMethod {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CompressionMethod::None => f.write_str("none"),
+            CompressionMethod::Zstd => f.write_str("zstd"),
+            CompressionMethod::Ans => f.write_str("ans"),
+        }
+    }
+}
+
+/// A single chunk in the compressed body chunk index.
+///
+/// The body is split into fixed-size decompressed chunks (typically 16 MiB).
+/// Each chunk is independently compressed, enabling parallel GPU decompression
+/// via nvcomp's batch API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressedChunk {
+    /// Byte offset of this chunk within the compressed body.
+    pub compressed_offset: usize,
+    /// Compressed size in bytes.
+    pub compressed_size: usize,
+    /// Byte offset of this chunk's data in the decompressed body.
+    pub decompressed_offset: usize,
+    /// Decompressed size in bytes.
+    pub decompressed_size: usize,
+}
+
+/// Complete compression metadata stored in the safetensors header.
+///
+/// This is serialized into the `__metadata__` section of the header JSON
+/// under the key `"compression_info"` as a JSON string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressionInfo {
+    /// The compression algorithm used.
+    pub method: CompressionMethod,
+    /// Compression level used during encoding (informational).
+    pub level: i32,
+    /// Total decompressed body size in bytes.
+    pub decompressed_size: usize,
+    /// Total compressed body size in bytes (= actual file body size).
+    pub compressed_size: usize,
+    /// Decompressed chunk size used during encoding (e.g. 16 MiB).
+    pub chunk_size: usize,
+    /// Ordered list of chunks.
+    pub chunks: Vec<CompressedChunk>,
+}
+
+impl CompressionInfo {
+    /// Returns the number of chunks.
+    pub fn num_chunks(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Returns `true` if the body is actually compressed.
+    pub fn is_compressed(&self) -> bool {
+        self.method != CompressionMethod::None
+    }
+
+    /// Parse compression info from the `__metadata__` map.
+    ///
+    /// Returns `None` if the metadata does not contain compression info
+    /// or if `"compression"` is `"none"`.
+    pub fn from_metadata(metadata: &Option<HashMap<String, String>>) -> Option<Self> {
+        let meta = metadata.as_ref()?;
+        let method_str = meta.get("compression")?;
+        if method_str == "none" {
+            return None;
+        }
+        let info_str = meta.get("compression_info")?;
+        serde_json::from_str(info_str).ok()
+    }
+
+    /// Encode compression info into a metadata map for serialization.
+    ///
+    /// Inserts `"compression"` and `"compression_info"` keys.
+    pub fn to_metadata_entries(&self) -> Vec<(String, String)> {
+        let mut entries = Vec::with_capacity(2);
+        entries.push(("compression".to_string(), self.method.to_string()));
+        if let Ok(json) = serde_json::to_string(self) {
+            entries.push(("compression_info".to_string(), json));
+        }
+        entries
+    }
 }
 
 impl Dtype {
@@ -1571,4 +1736,27 @@ mod tests {
             _ => panic!("This should not be able to be serialized"),
         }
     }
+}
+
+#[test]
+fn test_ans_compression_info_deserialize() {
+    let json = r#"{"method":"Ans","level":0,"decompressed_size":100,"compressed_size":80,"chunk_size":100,"chunks":[]}"#;
+    let ci: CompressionInfo = serde_json::from_str(json).expect("failed to deserialize ANS CompressionInfo");
+    assert_eq!(ci.method, CompressionMethod::Ans);
+    assert_eq!(ci.decompressed_size, 100);
+}
+
+#[test]
+fn test_ans_from_metadata() {
+    use crate::lib::HashMap;
+    let mut meta = HashMap::new();
+    meta.insert("compression".to_string(), "ans".to_string());
+    meta.insert("compression_info".to_string(), 
+        r#"{"method": "Ans", "level": 0, "decompressed_size": 2000000, "compressed_size": 1551166, "chunk_size": 16777216, "chunks": [{"compressed_offset": 0, "compressed_size": 1551166, "decompressed_offset": 0, "decompressed_size": 2000000}]}"#.to_string());
+    let opt_meta = Some(meta);
+    let ci = CompressionInfo::from_metadata(&opt_meta);
+    assert!(ci.is_some(), "CompressionInfo::from_metadata returned None!");
+    let ci = ci.unwrap();
+    assert_eq!(ci.method, CompressionMethod::Ans);
+    assert_eq!(ci.compressed_size, 1551166);
 }

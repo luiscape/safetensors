@@ -342,6 +342,57 @@ def save_file(
     )
 
 
+def save_compressed(
+    tensors: Dict[str, torch.Tensor],
+    filename: Union[str, os.PathLike],
+    metadata: Optional[Dict[str, str]] = None,
+    compression: str = "zstd",
+    level: int = 3,
+    chunk_size: int = 16 * 1024 * 1024,
+) -> None:
+    """Save tensors to a compressed safetensors file.
+
+    The body is split into independently-compressed chunks (default 16 MiB)
+    for parallel GPU decompression via nvcomp.  CPU decompression via the
+    ``zstandard`` Python package is used as a fallback.
+
+    Requires the ``zstandard`` package: ``pip install zstandard``.
+
+    Args:
+        tensors (`Dict[str, torch.Tensor]`):
+            The tensors to save.
+        filename (`str` or `os.PathLike`):
+            Output file path.
+        metadata (`Optional[Dict[str, str]]`):
+            Optional user metadata to store in the header.
+        compression (`str`, defaults to ``"zstd"``):
+            Compression method. Currently only ``"zstd"`` is supported.
+        level (`int`, defaults to ``3``):
+            Compression level (1–19 for zstd).
+        chunk_size (`int`, defaults to ``16 * 1024 * 1024``):
+            Decompressed chunk size in bytes.
+
+    Example:
+
+    ```python
+    from safetensors.torch import save_compressed, load_file
+
+    save_compressed({"weight": model.weight}, "model.safetensors.zst")
+    loaded = load_file("model.safetensors.zst", device="cuda:0")
+    ```
+    """
+    from .fast import save_compressed as _save_compressed
+
+    _save_compressed(
+        tensors,
+        str(filename),
+        metadata=metadata,
+        compression=compression,
+        level=level,
+        chunk_size=chunk_size,
+    )
+
+
 def load_file(
     filename: Union[str, os.PathLike], device: Union[str, int] = "cpu"
 ) -> Dict[str, torch.Tensor]:

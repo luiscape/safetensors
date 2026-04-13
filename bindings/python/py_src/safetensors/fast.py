@@ -192,6 +192,27 @@ def _file_body_size(filename: str, header_size: int) -> int:
     return body
 
 
+def _parse_compression_info(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract compression info from safetensors header metadata.
+
+    Returns:
+        A dict with compression info if the file is compressed, else None.
+        The dict has keys: method, level, decompressed_size, compressed_size,
+        chunk_size, chunks (list of dicts with compressed_offset, compressed_size,
+        decompressed_offset, decompressed_size).
+    """
+    method = metadata.get("compression")
+    if not method or method == "none":
+        return None
+    info_str = metadata.get("compression_info")
+    if not info_str:
+        return None
+    try:
+        return json.loads(info_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # I/O helpers
 # ---------------------------------------------------------------------------
@@ -1837,3 +1858,335 @@ def fast_load_sharded(
     finally:
         files_buffer.close()
         loader.close()
+
+
+def save_compressed(
+    tensors: Dict[str, "torch.Tensor"],
+    filename: str,
+    metadata: Optional[Dict[str, str]] = None,
+    compression: str = "zstd",
+    level: int = 3,
+    chunk_size: int = 16 * 1024 * 1024,
+) -> None:
+    """Save tensors to a compressed safetensors file.
+
+    The file uses the standard safetensors header format with additional
+    compression metadata in ``__metadata__``.  The **entire body** is
+    compressed as a single blob — nvcomp handles internal chunking for
+    parallel GPU decompression automatically.
+
+    Supported compression algorithms:
+
+    * ``"zstd"`` — Zstandard.  Good compression ratio (~1.27× on BF16
+      weights), moderate GPU throughput (~16-19 GB/s compress, ~40 GB/s
+      decompress on Blackwell).  Best for network-filesystem storage
+      (≤10 GB/s).
+    * ``"ans"`` — Asymmetric Numeral Systems (gANS).  Nearly the same
+      ratio (~1.25×) at **10× the GPU throughput** (~181 GB/s compress,
+      ~247 GB/s decompress).  Best for GPUDirect Storage / fast NVMe
+      (≥15 GB/s).  Requires ``nvidia-nvcomp`` for both save and load.
+
+    For ``"zstd"`` the CPU ``zstandard`` package is used as the compressor
+    (widely available, no GPU needed to create files).  For ``"ans"`` the
+    ``nvidia.nvcomp`` Python package with a CUDA GPU is required.
+
+    See https://developer.nvidia.com/blog/cut-checkpoint-costs-with-about-30-lines-of-python-and-nvidia-nvcomp/
+    for background on nvcomp checkpoint compression.
+
+    Args:
+        tensors: dictionary of tensor name to ``torch.Tensor``.
+        filename: output file path.
+        metadata: optional user metadata dict.
+        compression: ``"zstd"`` (default) or ``"ans"``.
+        level: zstd compression level (1-19, default 3).  Ignored for ANS.
+        chunk_size: hint for internal nvcomp chunking (default 16 MiB).
+            Only affects the ``compression_info`` metadata; nvcomp manages
+            actual parallelism internally.
+
+    Raises:
+        ValueError: if the compression method is not supported.
+        ImportError: if required packages are not installed.
+    """
+    if compression not in ("zstd", "ans"):
+        raise ValueError(
+            f"Unsupported compression method: {compression!r}. "
+            f"Supported: 'zstd', 'ans'."
+        )
+
+    torch = _import_torch()
+
+    # Step 1: Serialize tensors to an uncompressed safetensors buffer.
+    from safetensors.torch import save
+
+    raw_bytes = save(tensors, metadata=metadata)
+
+    # Parse header length
+    header_json_len = struct.unpack("<Q", raw_bytes[:8])[0]
+    header_bytes = raw_bytes[8 : 8 + header_json_len]
+    body_bytes = raw_bytes[8 + header_json_len :]
+    decompressed_size = len(body_bytes)
+
+    # Step 2: Compress the body in explicit chunks.
+    # For ANS: use nvcomp GPU encoder per-chunk (matching the batched C API
+    # decompressor which needs per-chunk compressed buffers).
+    # For ZSTD: use CPU zstandard per-chunk.
+    chunks_meta = []
+    compressed_chunks = []
+    compressed_offset = 0
+
+    if compression == "ans":
+        compressed_chunks, chunks_meta, compressed_offset = _compress_chunks_nvcomp(
+            body_bytes, chunk_size, algorithm="ans"
+        )
+    else:
+        try:
+            import zstandard as zstd_lib
+        except ImportError:
+            raise ImportError(
+                "The 'zstandard' package is required for zstd compressed "
+                "safetensors. Install it with: pip install zstandard"
+            )
+        compressor = zstd_lib.ZstdCompressor(level=level)
+        for decompressed_offset in range(0, decompressed_size, chunk_size):
+            chunk_end = min(decompressed_offset + chunk_size, decompressed_size)
+            chunk_data = body_bytes[decompressed_offset:chunk_end]
+            compressed_chunk = compressor.compress(chunk_data)
+            chunks_meta.append(
+                {
+                    "compressed_offset": compressed_offset,
+                    "compressed_size": len(compressed_chunk),
+                    "decompressed_offset": decompressed_offset,
+                    "decompressed_size": len(chunk_data),
+                }
+            )
+            compressed_chunks.append(compressed_chunk)
+            compressed_offset += len(compressed_chunk)
+
+    total_compressed_size = compressed_offset
+
+    # Step 3: Build compression_info metadata.
+    compression_info = {
+        "method": "Zstd" if compression == "zstd" else "Ans",
+        "level": level if compression == "zstd" else 0,
+        "decompressed_size": decompressed_size,
+        "compressed_size": total_compressed_size,
+        "chunk_size": chunk_size,
+        "chunks": chunks_meta,
+    }
+
+    # Parse original header, inject compression metadata, re-serialize.
+    header = json.loads(header_bytes)
+    if "__metadata__" not in header:
+        header["__metadata__"] = {}
+    header["__metadata__"]["compression"] = compression
+    header["__metadata__"]["compression_info"] = json.dumps(compression_info)
+
+    new_header_json = json.dumps(header, separators=(",", ":")).encode("utf-8")
+
+    # Pad to 8-byte alignment
+    padding_needed = (8 - (len(new_header_json) % 8)) % 8
+    new_header_json += b" " * padding_needed
+
+    # Step 4: Write the compressed file.
+    with open(filename, "wb") as f:
+        f.write(struct.pack("<Q", len(new_header_json)))
+        f.write(new_header_json)
+        for chunk in compressed_chunks:
+            f.write(chunk)
+
+
+def _compress_chunks_nvcomp(
+    data: bytes,
+    chunk_size: int,
+    algorithm: str = "ans",
+) -> "Tuple[List[bytes], List[Dict], int]":
+    """Compress data in explicit chunks using the nvcomp C batched API via the
+    ``libnvcomp_shim.so`` ABI shim.
+
+    This produces NVCOMP_NATIVE format that is directly compatible with the
+    batched C decompression API used by the Rust loading path.  Using the
+    Python ``Codec`` for compression and the C batched API for decompression
+    does **not** work because they produce/consume different internal formats.
+
+    The shim is the same one loaded by the Rust ``NvcompRuntime``.
+
+    Returns ``(compressed_chunks_bytes, chunks_meta, total_compressed_offset)``.
+    """
+    import ctypes as C
+
+    torch = _import_torch()
+
+    # ---- load libraries ----
+    try:
+        shim = C.CDLL("libnvcomp_shim.so")
+    except OSError:
+        raise RuntimeError(
+            "libnvcomp_shim.so not found on LD_LIBRARY_PATH. "
+            "Build it from safetensors/bindings/python/src/nvcomp_shim.c"
+        )
+    try:
+        cudart = C.CDLL("libcudart.so")
+    except OSError:
+        raise RuntimeError("libcudart.so not found — is CUDA installed?")
+
+    cudart.cudaSetDevice(0)
+
+    # ---- helpers ----
+    def _cm(n):
+        p = C.c_void_p()
+        s = cudart.cudaMalloc(C.byref(p), C.c_size_t(n))
+        if s != 0:
+            raise RuntimeError(f"cudaMalloc({n}) failed: {s}")
+        return p
+
+    def _h2d(dst, src_bytes, n):
+        buf = (C.c_char * n).from_buffer_copy(src_bytes)
+        s = cudart.cudaMemcpy(dst, buf, C.c_size_t(n), 1)
+        if s != 0:
+            raise RuntimeError(f"cudaMemcpy H2D failed: {s}")
+
+    def _d2h_bytes(src, n):
+        buf = (C.c_char * n)()
+        s = cudart.cudaMemcpy(buf, src, C.c_size_t(n), 2)
+        if s != 0:
+            raise RuntimeError(f"cudaMemcpy D2H failed: {s}")
+        return bytes(buf)
+
+    def _sync():
+        cudart.cudaDeviceSynchronize()
+
+    def _free(p):
+        cudart.cudaFree(p)
+
+    def _make_dev_ptrs(ptrs):
+        n = len(ptrs)
+        h = (C.c_void_p * n)(*ptrs)
+        d = _cm(n * 8)
+        _h2d(d, bytes(h), n * 8)
+        return d
+
+    def _make_dev_sizes(sizes):
+        n = len(sizes)
+        h = (C.c_size_t * n)(*sizes)
+        d = _cm(n * 8)
+        _h2d(d, bytes(h), n * 8)
+        return d
+
+    # ---- opts ----
+    class CompOpts(C.Structure):
+        _fields_ = [("data", C.c_char * 64)]
+
+    comp_opts = CompOpts()
+    C.memset(C.byref(comp_opts), 0, 64)
+
+    # ---- split into chunks and upload ----
+    total = len(data)
+    num_chunks = (total + chunk_size - 1) // chunk_size
+    chunk_sizes_list = []
+    chunk_gpu_ptrs = []
+
+    # Upload all uncompressed chunks to one contiguous GPU buffer
+    src_gpu = _cm(total)
+    _h2d(src_gpu, data, total)
+    _sync()
+
+    uncomp_ptrs_list = []
+    for i in range(num_chunks):
+        off = i * chunk_size
+        sz = min(chunk_size, total - off)
+        chunk_sizes_list.append(sz)
+        uncomp_ptrs_list.append(C.c_void_p(src_gpu.value + off))
+
+    # ---- get max output chunk size ----
+    max_out = C.c_size_t(0)
+    s = shim.nvcomp_shim_ans_compress_get_max_output_chunk_size(
+        C.c_size_t(chunk_size), C.byref(comp_opts), C.byref(max_out)
+    )
+    if s != 0:
+        raise RuntimeError(
+            f"nvcomp_shim_ans_compress_get_max_output_chunk_size failed: {s}"
+        )
+
+    # ---- allocate per-chunk output buffers ----
+    comp_gpu_ptrs = [_cm(max_out.value) for _ in range(num_chunks)]
+
+    # ---- get temp size ----
+    temp_bytes = C.c_size_t(0)
+    s = shim.nvcomp_shim_ans_compress_get_temp_size(
+        C.c_size_t(num_chunks),
+        C.c_size_t(chunk_size),
+        C.byref(comp_opts),
+        C.byref(temp_bytes),
+        C.c_size_t(total),
+    )
+    if s != 0:
+        raise RuntimeError(f"nvcomp_shim_ans_compress_get_temp_size failed: {s}")
+    temp_gpu = _cm(temp_bytes.value)
+
+    # ---- build device arrays ----
+    d_uncomp_ptrs = _make_dev_ptrs(uncomp_ptrs_list)
+    d_uncomp_sizes = _make_dev_sizes(chunk_sizes_list)
+    d_comp_ptrs = _make_dev_ptrs(comp_gpu_ptrs)
+    d_comp_sizes = _make_dev_sizes([0] * num_chunks)
+    _sync()
+
+    # ---- batched compress ----
+    s = shim.nvcomp_shim_ans_compress_async(
+        d_uncomp_ptrs,
+        d_uncomp_sizes,
+        C.c_size_t(chunk_size),
+        C.c_size_t(num_chunks),
+        temp_gpu,
+        C.c_size_t(temp_bytes.value),
+        d_comp_ptrs,
+        d_comp_sizes,
+        C.byref(comp_opts),
+        C.c_void_p(0),  # statuses
+        C.c_void_p(0),  # default stream
+    )
+    if s != 0:
+        raise RuntimeError(f"nvcomp_shim_ans_compress_async failed: {s}")
+    _sync()
+
+    # ---- read back per-chunk compressed sizes ----
+    host_comp_sizes = (C.c_size_t * num_chunks)()
+    cudart.cudaMemcpy(host_comp_sizes, d_comp_sizes, C.c_size_t(num_chunks * 8), 2)
+
+    # ---- download compressed chunks and build metadata ----
+    compressed_chunks = []
+    chunks_meta = []
+    compressed_offset = 0
+
+    ALIGN = 8
+    for i in range(num_chunks):
+        cs = host_comp_sizes[i]
+        comp_bytes = _d2h_bytes(comp_gpu_ptrs[i], cs)
+        # Pad to 8-byte alignment so chunk boundaries in the file are aligned.
+        # The batched ANS decompressor requires 8-byte aligned input pointers.
+        padded_cs = ((cs + ALIGN - 1) // ALIGN) * ALIGN
+        padding = padded_cs - cs
+        if padding > 0:
+            comp_bytes += b"\x00" * padding
+        chunks_meta.append(
+            {
+                "compressed_offset": compressed_offset,
+                "compressed_size": cs,  # actual compressed size (without padding)
+                "padded_size": padded_cs,  # padded size for alignment
+                "decompressed_offset": i * chunk_size,
+                "decompressed_size": chunk_sizes_list[i],
+            }
+        )
+        compressed_chunks.append(comp_bytes)
+        compressed_offset += padded_cs  # advance by padded size
+
+    # ---- cleanup GPU memory ----
+    _free(src_gpu)
+    _free(temp_gpu)
+    _free(d_uncomp_ptrs)
+    _free(d_uncomp_sizes)
+    _free(d_comp_ptrs)
+    _free(d_comp_sizes)
+    for p in comp_gpu_ptrs:
+        _free(p)
+
+    return compressed_chunks, chunks_meta, compressed_offset

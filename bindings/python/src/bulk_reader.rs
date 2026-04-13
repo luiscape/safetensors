@@ -509,6 +509,212 @@ impl BulkFileReader {
 
         result
     }
+
+    /// Reads a compressed safetensors file body and decompresses it into
+    /// a device buffer.
+    ///
+    /// The pipeline:
+    /// 1. Read the compressed body from disk (parallel pread into host memory)
+    /// 2. For GPU targets with nvcomp:
+    ///    a. Allocate a temporary compressed buffer on GPU
+    ///    b. Copy compressed data to GPU
+    ///    c. Run nvcomp batched zstd decompression on GPU
+    ///    d. Free the compressed GPU buffer
+    /// 3. For CPU targets (or without nvcomp):
+    ///    a. Decompress on CPU using the zstd crate
+    ///    b. Copy decompressed data to the device buffer
+    ///
+    /// # Arguments
+    ///
+    /// * `py` — Active Python GIL token.
+    /// * `path` — Path to the compressed safetensors file.
+    /// * `header_size` — Total header size in bytes.
+    /// * `compressed_body_size` — Size of the compressed body in bytes.
+    /// * `decompressed_body_size` — Expected decompressed size.
+    /// * `device_buffer` — Pre-allocated device buffer for decompressed output.
+    /// * `chunks` — Chunk descriptors: `(comp_offset, comp_size, decomp_offset, decomp_size)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `PyErr` if I/O, decompression, or device operations fail.
+    #[cfg(feature = "nvcomp")]
+    pub fn read_compressed_file_to_device(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        header_size: usize,
+        compressed_body_size: usize,
+        decompressed_body_size: usize,
+        device_buffer: &DeviceBuffer,
+        chunks: &[(usize, usize, usize, usize)],
+        algorithm: &str,
+    ) -> PyResult<()> {
+        let is_gpu = !(device_buffer.device == "cpu" || device_buffer.device.starts_with("cpu:"));
+
+        // Read compressed body from disk (shared by all paths).
+        let compressed_host = self
+            .read_file_body_to_host(path, header_size, compressed_body_size)
+            .map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!("Failed to read compressed body: {e}"))
+            })?;
+
+        if is_gpu {
+            // GPU path: use nvcomp C shim for ANS/ZSTD decompression.
+            // ANS can ONLY be decoded on GPU (no CPU fallback).
+            // ZSTD can fall back to CPU if nvcomp is unavailable.
+            let nvcomp_available = {
+                use crate::nvcomp_runtime::NvcompRuntime;
+                let avail = NvcompRuntime::is_available();
+                if !avail {
+                    eprintln!(
+                        "[safetensors] nvcomp shim not available (libnvcomp_shim.so not found on LD_LIBRARY_PATH)"
+                    );
+                }
+                avail
+            };
+
+            let is_ans = algorithm.eq_ignore_ascii_case("ans");
+
+            if nvcomp_available {
+                // Allocate compressed staging buffer on GPU, copy data, decompress.
+                let device_str = &device_buffer.device;
+                let compressed_gpu_buf =
+                    device_buffer::allocate_device_buffer(py, compressed_body_size, device_str)?;
+
+                device_buffer::copy_host_to_device_buffer(
+                    py,
+                    &compressed_host,
+                    &compressed_gpu_buf,
+                    0,
+                )?;
+
+                drop(compressed_host);
+
+                device_buffer::decompress_on_gpu(
+                    py,
+                    &compressed_gpu_buf,
+                    device_buffer,
+                    chunks,
+                    algorithm,
+                )?;
+            } else if is_ans {
+                // ANS cannot be decoded on CPU — fail with a clear error.
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "ANS-compressed safetensors require nvcomp for GPU decompression, \
+                     but libnvcomp_shim.so was not found. Ensure nvcomp is installed \
+                     and libnvcomp_shim.so is on LD_LIBRARY_PATH.",
+                ));
+            } else {
+                // ZSTD CPU fallback: decompress on host, then copy to GPU.
+                let decompressed =
+                    device_buffer::decompress_cpu_zstd(&compressed_host, decompressed_body_size)
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+                drop(compressed_host);
+
+                device_buffer::copy_host_to_device_buffer(py, &decompressed, device_buffer, 0)?;
+            }
+        } else {
+            // CPU device path.
+            let is_ans = algorithm.eq_ignore_ascii_case("ans");
+            if is_ans {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "ANS-compressed safetensors cannot be loaded on CPU. \
+                     Use a CUDA device with nvcomp installed.",
+                ));
+            }
+            // ZSTD CPU path: decompress on CPU, copy to buffer
+            let decompressed =
+                device_buffer::decompress_cpu_zstd(&compressed_host, decompressed_body_size)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+            drop(compressed_host);
+
+            device_buffer::copy_host_to_device_buffer(py, &decompressed, device_buffer, 0)?;
+        }
+
+        Ok(())
+    }
+
+    /// Reads a compressed safetensors file body directly to GPU via GDS,
+    /// then decompresses on GPU using nvcomp.
+    ///
+    /// This is the highest-throughput compressed loading path:
+    /// 1. cuFileRead compressed data directly from NVMe to GPU (bypasses CPU)
+    /// 2. nvcomp batched zstd decompression on GPU
+    ///
+    /// # Arguments
+    ///
+    /// * `py` — Active Python GIL token.
+    /// * `path` — Path to the compressed safetensors file.
+    /// * `header_size` — Total header size in bytes.
+    /// * `compressed_body_size` — Compressed body size in bytes.
+    /// * `decompressed_buf` — Pre-allocated device buffer for decompressed output.
+    /// * `chunks` — Chunk descriptors.
+    /// * `device_str` — Device string (e.g. "cuda:0").
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if GDS + nvcomp succeeded, `Ok(false)` if GDS is not available,
+    /// `Err` on failure.
+    #[cfg(all(feature = "nvcomp", feature = "gds"))]
+    pub fn read_compressed_file_gds_decompress(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        header_size: usize,
+        compressed_body_size: usize,
+        decompressed_buf: &DeviceBuffer,
+        chunks: &[(usize, usize, usize, usize)],
+        device_str: &str,
+        algorithm: &str,
+    ) -> PyResult<bool> {
+        // Check if GDS is available
+        let gds = match device_buffer::get_gds_context() {
+            Ok(g) => g,
+            Err(_) => return Ok(false),
+        };
+
+        // Allocate compressed staging buffer on GPU via the buffer pool
+        let compressed_gpu_buf =
+            device_buffer::GdsBufferPool::acquire(py, compressed_body_size, device_str).map_err(
+                |e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "GDS buffer pool acquire for compressed data failed: {e}"
+                    ))
+                },
+            )?;
+
+        let dev_ptr = compressed_gpu_buf.data_ptr as *mut std::ffi::c_void;
+
+        // Read compressed data directly from NVMe to GPU via GDS
+        unsafe {
+            device_buffer::gds_read_file_body_pooled(
+                gds,
+                path,
+                header_size,
+                compressed_body_size,
+                dev_ptr,
+                0,
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "GDS read of compressed data failed: {e}"
+                ))
+            })?;
+        }
+
+        // Decompress on GPU
+        device_buffer::decompress_on_gpu(
+            py,
+            &compressed_gpu_buf,
+            decompressed_buf,
+            chunks,
+            algorithm,
+        )?;
+
+        Ok(true)
+    }
 }
 
 // ---- GDS bulk read ---------------------------------------------------------

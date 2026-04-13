@@ -709,6 +709,106 @@ pub fn tensor_byte_ranges(metadata: &Metadata) -> HashMap<String, (usize, usize)
         .collect()
 }
 
+// ─── CompressedReadPlan ─────────────────────────────────────────────────────
+
+/// A read plan for compressed safetensors files.
+///
+/// When the file body is zstd-compressed with a chunk index, this plan
+/// describes how to read the compressed data and maps each compressed chunk
+/// to its decompressed location for GPU-side batch decompression via nvcomp.
+#[derive(Debug, Clone)]
+pub struct CompressedReadPlan {
+    /// Absolute byte offset of the (compressed) body in the file.
+    pub body_file_offset: usize,
+    /// Compressed body length in bytes (= file body size).
+    pub compressed_body_length: usize,
+    /// Decompressed body length in bytes.
+    pub decompressed_body_length: usize,
+    /// Per-chunk read descriptors.
+    pub chunks: Vec<CompressedChunkRead>,
+}
+
+/// A single chunk read descriptor for compressed loading.
+#[derive(Debug, Clone)]
+pub struct CompressedChunkRead {
+    /// Absolute byte offset in the file where this compressed chunk starts.
+    pub file_offset: usize,
+    /// Offset within the compressed staging buffer.
+    pub compressed_buffer_offset: usize,
+    /// Size of this compressed chunk in bytes.
+    pub compressed_size: usize,
+    /// Offset within the decompressed output buffer.
+    pub decompressed_buffer_offset: usize,
+    /// Decompressed size of this chunk.
+    pub decompressed_size: usize,
+}
+
+impl CompressedReadPlan {
+    /// Create a compressed read plan from [`CompressionInfo`] and header size.
+    ///
+    /// # Arguments
+    ///
+    /// * `header_size` – Total file header size (8-byte prefix + JSON).
+    /// * `info` – Compression metadata parsed from the header.
+    pub fn new(header_size: usize, info: &crate::tensor::CompressionInfo) -> Self {
+        let body_file_offset = header_size;
+        let chunks = info
+            .chunks
+            .iter()
+            .map(|c| CompressedChunkRead {
+                file_offset: body_file_offset + c.compressed_offset,
+                compressed_buffer_offset: c.compressed_offset,
+                compressed_size: c.compressed_size,
+                decompressed_buffer_offset: c.decompressed_offset,
+                decompressed_size: c.decompressed_size,
+            })
+            .collect();
+
+        Self {
+            body_file_offset,
+            compressed_body_length: info.compressed_size,
+            decompressed_body_length: info.decompressed_size,
+            chunks,
+        }
+    }
+
+    /// Number of compressed chunks.
+    pub fn num_chunks(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Total size needed for the compressed staging buffer.
+    pub fn compressed_buffer_size(&self) -> usize {
+        self.compressed_body_length
+    }
+
+    /// Total size needed for the decompressed output buffer.
+    pub fn decompressed_buffer_size(&self) -> usize {
+        self.decompressed_body_length
+    }
+
+    /// Create a [`BulkReadPlan`] for reading the compressed body.
+    ///
+    /// This produces a standard read plan against the compressed body length,
+    /// suitable for `PreadBulkReader` or GDS bulk reads.
+    pub fn as_bulk_read_plan(&self, max_block_size: Option<usize>) -> BulkReadPlan {
+        BulkReadPlan::new(
+            self.body_file_offset,
+            self.compressed_body_length,
+            max_block_size,
+        )
+    }
+
+    /// Create a [`GdsReadPlan`] for reading the compressed body with GDS.
+    pub fn as_gds_read_plan(&self, max_block_size: Option<usize>) -> GdsReadPlan {
+        GdsReadPlan::new(
+            self.body_file_offset,
+            self.compressed_body_length,
+            max_block_size,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,5 +941,60 @@ mod tests {
         let result = get_numa_node_for_device("0000:00");
         // We just verify it doesn't panic; the result depends on the platform.
         let _ = result;
+    }
+
+    #[test]
+    fn test_compressed_read_plan_basic() {
+        use crate::tensor::{CompressedChunk, CompressionInfo, CompressionMethod};
+        let info = CompressionInfo {
+            method: CompressionMethod::Zstd,
+            level: 3,
+            decompressed_size: 32 * 1024 * 1024, // 32 MiB
+            compressed_size: 20 * 1024 * 1024,   // 20 MiB
+            chunk_size: 16 * 1024 * 1024,
+            chunks: vec![
+                CompressedChunk {
+                    compressed_offset: 0,
+                    compressed_size: 10 * 1024 * 1024,
+                    decompressed_offset: 0,
+                    decompressed_size: 16 * 1024 * 1024,
+                },
+                CompressedChunk {
+                    compressed_offset: 10 * 1024 * 1024,
+                    compressed_size: 10 * 1024 * 1024,
+                    decompressed_offset: 16 * 1024 * 1024,
+                    decompressed_size: 16 * 1024 * 1024,
+                },
+            ],
+        };
+
+        let plan = CompressedReadPlan::new(4096, &info);
+        assert_eq!(plan.num_chunks(), 2);
+        assert_eq!(plan.compressed_buffer_size(), 20 * 1024 * 1024);
+        assert_eq!(plan.decompressed_buffer_size(), 32 * 1024 * 1024);
+        assert_eq!(plan.chunks[0].file_offset, 4096);
+        assert_eq!(plan.chunks[1].file_offset, 4096 + 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_compressed_read_plan_as_bulk() {
+        use crate::tensor::{CompressedChunk, CompressionInfo, CompressionMethod};
+        let info = CompressionInfo {
+            method: CompressionMethod::Zstd,
+            level: 1,
+            decompressed_size: 100,
+            compressed_size: 60,
+            chunk_size: 100,
+            chunks: vec![CompressedChunk {
+                compressed_offset: 0,
+                compressed_size: 60,
+                decompressed_offset: 0,
+                decompressed_size: 100,
+            }],
+        };
+        let plan = CompressedReadPlan::new(256, &info);
+        let bulk = plan.as_bulk_read_plan(None);
+        assert_eq!(bulk.body_file_offset, 256);
+        assert_eq!(bulk.body_length, 60);
     }
 }
